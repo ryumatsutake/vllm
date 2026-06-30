@@ -404,7 +404,7 @@ def _dp_worker(
     seq_lens: list[int],
 ) -> None:
     """Worker process for one DP rank."""
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     gpu_start = rank * tp_size
     gpus = ",".join(str(gpu_start + i) for i in range(tp_size))
@@ -437,6 +437,8 @@ def _dp_worker(
 
 
 def main() -> None:
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
     args = parse_args()
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
@@ -496,6 +498,21 @@ def main() -> None:
         sys.exit(1)
 
     results = rank_results[0]
+
+    if len(rank_results) > 1:
+        for i, r0 in enumerate(results):
+            peer_p50s = [rank_results[r][i].p50_ms
+                         for r in rank_results if r != 0]
+            for r, p50 in zip(
+                [r for r in rank_results if r != 0], peer_p50s
+            ):
+                diff_pct = abs(p50 - r0.p50_ms) / max(r0.p50_ms, 1e-6) * 100
+                if diff_pct > 10:
+                    print(f"WARNING: rank {r} p50={p50:.2f}ms vs "
+                          f"rank 0 p50={r0.p50_ms:.2f}ms "
+                          f"({diff_pct:.0f}% diff) for "
+                          f"bs={r0.batch_size} seq={r0.seq_len}")
+
     print()
     print(f"=== DP={dp_size} (showing rank 0 results, "
           f"batch_size is global) ===")
