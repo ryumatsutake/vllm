@@ -68,7 +68,13 @@ class BenchHarness:
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         enable_expert_parallel: bool = False,
+        dp_barrier=None,
     ):
+        self._dp_barrier = dp_barrier
+
+        if dp_barrier is not None:
+            self._patch_executor_for_dp_sync(dp_barrier)
+
         self.llm = LLM(
             model=model,
             enforce_eager=enforce_eager,
@@ -84,6 +90,9 @@ class BenchHarness:
             enable_expert_parallel=enable_expert_parallel,
             additional_config={"gdn_prefill_backend": "triton"},
         )
+
+        if dp_barrier is not None:
+            self._unpatch_executor()
 
         client = self.llm.llm_engine.engine_core
         engine_core = getattr(client, 'engine_core', client)
@@ -122,6 +131,52 @@ class BenchHarness:
             req_ids.append(req_id)
         return req_ids
 
+    @staticmethod
+    def _patch_executor_for_dp_sync(barrier):
+        """Monkey-patch Executor to add DP barriers during engine init.
+
+        With DP+EP, engine init stages (profiling, CUDA graph capture) involve
+        NCCL collectives across DP ranks. Independent DP rank processes may
+        reach these stages at different times, causing NCCL mismatch deadlocks.
+        Patching adds a barrier before each stage so all ranks enter together.
+        """
+        from vllm.v1.executor.abstract import Executor
+        Executor._orig_determine_available_memory = (
+            Executor.determine_available_memory)
+        Executor._orig_initialize_from_config = (
+            Executor.initialize_from_config)
+
+        def _synced_determine(self):
+            barrier.wait()
+            return Executor._orig_determine_available_memory(self)
+
+        def _synced_initialize(self, kv_cache_configs):
+            barrier.wait()
+            return Executor._orig_initialize_from_config(self, kv_cache_configs)
+
+        Executor.determine_available_memory = _synced_determine
+        Executor.initialize_from_config = _synced_initialize
+
+    @staticmethod
+    def _unpatch_executor():
+        from vllm.v1.executor.abstract import Executor
+        Executor.determine_available_memory = (
+            Executor._orig_determine_available_memory)
+        Executor.initialize_from_config = (
+            Executor._orig_initialize_from_config)
+        del Executor._orig_determine_available_memory
+        del Executor._orig_initialize_from_config
+
+    def _sync_dp(self):
+        """Barrier across DP ranks before execute_model.
+
+        With EP, all DP ranks must enter execute_model together so NCCL
+        collectives (EP all-to-all, DP sync in dispatch_cg_and_sync_dp)
+        and CUDA graph replays proceed in lockstep.
+        """
+        if self._dp_barrier is not None:
+            self._dp_barrier.wait()
+
     def _execute_and_sample(self, scheduler_output):
         """Run execute_model + sample_tokens if needed (V2 model runner).
 
@@ -151,6 +206,7 @@ class BenchHarness:
         sampler + dispatch), excluding schedule().
         """
         scheduler_output = self.scheduler.schedule()
+        self._sync_dp()
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -168,6 +224,7 @@ class BenchHarness:
     def run_step_no_timing(self) -> StepStat:
         """Schedule + execute + update without GPU sync timing."""
         scheduler_output = self.scheduler.schedule()
+        self._sync_dp()
         model_output = self._execute_and_sample(scheduler_output)
         self.scheduler.update_from_output(scheduler_output, model_output)
 
@@ -293,6 +350,7 @@ class BenchHarness:
         # to free request slots. Skipping this leaves stale slots.
         while self.scheduler.has_requests():
             so = self.scheduler.schedule()
+            self._sync_dp()
             out = self._execute_and_sample(so)
             self.scheduler.update_from_output(so, out)
 
