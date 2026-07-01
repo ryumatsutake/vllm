@@ -312,6 +312,7 @@ def _run_bench_grid(
     args: argparse.Namespace,
     batch_sizes: list[int],
     seq_lens: list[int],
+    dp_barrier: multiprocessing.Barrier | None = None,
 ) -> list[BenchResult]:
     """Run the full benchmark grid on the current process. Returns results."""
     max_batch_size = max(batch_sizes)
@@ -330,6 +331,11 @@ def _run_bench_grid(
         enable_expert_parallel=args.enable_expert_parallel,
     )
     print(f"Harness ready in {time.time() - t0:.1f}s")
+
+    # With EP, execute_model requires all DP ranks to participate in
+    # all-to-all. Barrier ensures all ranks enter warmup/bench together.
+    if dp_barrier is not None:
+        dp_barrier.wait()
 
     min_seq = min(seq_lens)
     print(f"Global warmup (bs=1, seq_len={min_seq}) ...")
@@ -384,9 +390,14 @@ def _detect_moe(model: str) -> bool:
     from transformers import AutoConfig
     try:
         config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-        num_experts = getattr(config, "num_local_experts", 0) or \
-                      getattr(config, "num_experts", 0)
-        return num_experts > 0
+        for cfg in (config, getattr(config, "text_config", None)):
+            if cfg is None:
+                continue
+            num_experts = getattr(cfg, "num_local_experts", 0) or \
+                          getattr(cfg, "num_experts", 0)
+            if num_experts > 0:
+                return True
+        return False
     except Exception:
         return False
 
@@ -406,21 +417,28 @@ def _dp_worker(
     """Worker process for one DP rank."""
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
-    gpu_start = rank * tp_size
-    gpus = ",".join(str(gpu_start + i) for i in range(tp_size))
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
-
     if use_dp_env:
+        # Cross-DP EP mode: let vLLM handle GPU assignment via
+        # init_device()'s dp_local_rank * tp_pp_world_size + local_rank.
+        # Setting CUDA_VISIBLE_DEVICES here would conflict with that.
         os.environ["VLLM_DP_RANK"] = str(rank)
         os.environ["VLLM_DP_RANK_LOCAL"] = str(rank)
         os.environ["VLLM_DP_SIZE"] = str(dp_size)
         os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
         os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+    else:
+        # Independent DP mode (no EP): isolate each rank's GPUs.
+        gpu_start = rank * tp_size
+        gpus = ",".join(str(gpu_start + i) for i in range(tp_size))
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
     local_batch_sizes = [bs // dp_size for bs in batch_sizes]
     try:
         t_start = time.time()
-        results = _run_bench_grid(args, local_batch_sizes, seq_lens)
+        results = _run_bench_grid(
+            args, local_batch_sizes, seq_lens,
+            dp_barrier=barrier if use_dp_env else None,
+        )
         elapsed = time.time() - t_start
         for r in results:
             r.batch_size *= dp_size
@@ -461,6 +479,10 @@ def main() -> None:
             )
 
     use_dp_env = args.enable_expert_parallel and _detect_moe(args.model)
+    if use_dp_env and not args.enforce_eager:
+        print("EP+DP: forcing --enforce-eager (CUDA graphs deadlock "
+              "with cross-DP NCCL collectives)")
+        args.enforce_eager = True
     print(f"DP mode: {'EP (VLLM_DP env vars)' if use_dp_env else 'independent (CUDA_VISIBLE_DEVICES)'}, "
           f"dp_size={dp_size}")
 
