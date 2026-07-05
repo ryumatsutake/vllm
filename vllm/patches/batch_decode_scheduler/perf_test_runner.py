@@ -39,23 +39,54 @@ from vllm.patches.batch_decode_scheduler.perf_test_harness import BenchHarness
 
 @dataclass
 class BenchResult:
+    """One grid cell, aggregated RTP-LLM style.
+
+    Every ``*_ms`` is a trimmed mean over rounds (sort the per-round values,
+    drop min and max, average the rest — see ``_trimmed_mean``), matching
+    RTP-LLM ``batch_perf_impl.run``'s ``measurements[1:-1]``. Every
+    ``*_mean_ms`` is the raw mean over the same rounds, for reference.
+    The sample unit is the round (one per ``num_iters``), not the step.
+    """
+
     mode: str
     batch_size: int
     seq_len: int
-    # per-step forward_ms stats (≈ RTP-LLM decode_time_per_token)
-    p50_ms: float
-    p90_ms: float
-    p99_ms: float
-    mean_ms: float
-    num_samples: int
-    # per-request cost_time stats (≈ RTP-LLM cost_time_us)
-    cost_p50_ms: float = 0.0
-    cost_p90_ms: float = 0.0
+    num_rounds: int = 0
+    # per-round total wall time, begin -> last token (≈ RTP cost_time)
+    cost_ms: float = 0.0
     cost_mean_ms: float = 0.0
-    num_cost_samples: int = 0
-    # decode-mode breakdown (≈ RTP-LLM first_token_cost_time / decode_time_per_token)
+    # per-round prefill / first-token wall time (≈ RTP first_token_cost_time)
+    prefill_ms: float = 0.0
     prefill_mean_ms: float = 0.0
-    decode_per_token_mean_ms: float = 0.0
+    # per-round (cost - prefill) / decode_steps (≈ RTP decode_time_per_token)
+    per_token_ms: float = 0.0
+    per_token_mean_ms: float = 0.0
+
+    @property
+    def primary_ms(self) -> float:
+        """Headline metric: decode_time_per_token for decode, else prefill."""
+        return self.per_token_ms if self.mode == "decode" else self.prefill_ms
+
+
+def _trimmed_mean(samples: list[float]) -> float:
+    """RTP-LLM aggregation: sort, drop min and max, average the rest.
+
+    Falls back to plain mean when fewer than 3 samples (nothing to trim).
+    Mirrors batch_perf_impl.run: measurements.sort(); measurements[1:-1].
+    """
+    if not samples:
+        return 0.0
+    if len(samples) < 3:
+        return float(np.mean(samples))
+    trimmed = sorted(samples)[1:-1]
+    return float(np.mean(trimmed))
+
+
+def _agg(samples: list[float]) -> tuple[float, float]:
+    """Return (trimmed_mean, raw_mean) over rounds."""
+    if not samples:
+        return 0.0, 0.0
+    return _trimmed_mean(samples), float(np.mean(samples))
 
 
 def run_prefill_bench(
@@ -67,7 +98,6 @@ def run_prefill_bench(
     profile: bool = False,
     profile_steps: int = 3,
 ) -> BenchResult:
-    latencies: list[float] = []
     cost_times: list[float] = []
     total = num_warmup_iters + num_iters
     profiled = 0
@@ -83,12 +113,22 @@ def run_prefill_bench(
         if profile and profiled == profile_steps:
             harness.stop_profiling()
             profiled += 1  # prevent re-stop
+        # Wall time of the single prefill step (≈ RTP first_token_cost_time).
         cost_ms = harness.mark_batch_end()
         if i >= num_warmup_iters:
-            latencies.append(stat.forward_ms)
             cost_times.append(cost_ms)
         harness.drain()
-    return _summarize("prefill", batch_size, seq_len, latencies, cost_times)
+    cost_trim, cost_mean = _agg(cost_times)
+    return BenchResult(
+        mode="prefill",
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_rounds=len(cost_times),
+        cost_ms=cost_trim,
+        cost_mean_ms=cost_mean,
+        prefill_ms=cost_trim,        # prefill == total for a single step
+        prefill_mean_ms=cost_mean,
+    )
 
 
 def run_decode_bench(
@@ -102,12 +142,13 @@ def run_decode_bench(
     profile_steps: int = 3,
     skip_prefill_forward: bool = False,
 ) -> BenchResult:
-    latencies: list[float] = []
     cost_times: list[float] = []
     prefill_times: list[float] = []
+    per_token_times: list[float] = []
     total = num_warmup_iters + num_iters
     profiled = 0
     for i in range(total):
+        prefill_ms = 0.0
         if skip_prefill_forward:
             harness.submit_decode_only(
                 batch_size, kv_len, num_decode_steps,
@@ -122,8 +163,9 @@ def run_decode_bench(
             harness.mark_batch_start()
             setup_stat = harness.run_step()
             harness.assert_phase(setup_stat, "prefill")
-            if i >= num_warmup_iters:
-                prefill_times.append(setup_stat.forward_ms)
+            # Wall time to first token (≈ RTP first_token_cost_time), on the
+            # same batch-start clock as cost below.
+            prefill_ms = harness.mark_lap()
         for step in range(num_decode_steps):
             if (profile and i >= num_warmup_iters
                     and profiled < profile_steps):
@@ -135,91 +177,71 @@ def run_decode_bench(
             if profile and profiled == profile_steps:
                 harness.stop_profiling()
                 profiled += 1
-            if i >= num_warmup_iters:
-                latencies.append(stat.forward_ms)
+        # Whole round, begin -> last token (≈ RTP cost_time).
         cost_ms = harness.mark_batch_end()
         if i >= num_warmup_iters:
             cost_times.append(cost_ms)
+            prefill_times.append(prefill_ms)
+            # Per-round decode_time_per_token = (cost - prefill) / steps,
+            # matching RTP dataclass.ResponseInfo.decode_time_per_token.
+            per_token_times.append((cost_ms - prefill_ms) / num_decode_steps)
         harness.drain()
-    result = _summarize("decode", batch_size, kv_len, latencies, cost_times)
-    if prefill_times:
-        result.prefill_mean_ms = float(np.mean(prefill_times))
-        result.decode_per_token_mean_ms = result.mean_ms
-    return result
 
-
-def _summarize(
-    mode: str,
-    batch_size: int,
-    seq_len: int,
-    latencies: list[float],
-    cost_times: list[float] | None = None,
-) -> BenchResult:
-    arr = np.array(latencies)
-    result = BenchResult(
-        mode=mode,
+    cost_trim, cost_mean = _agg(cost_times)
+    prefill_trim, prefill_mean = _agg(prefill_times)
+    pt_trim, pt_mean = _agg(per_token_times)
+    return BenchResult(
+        mode="decode",
         batch_size=batch_size,
-        seq_len=seq_len,
-        p50_ms=float(np.percentile(arr, 50)),
-        p90_ms=float(np.percentile(arr, 90)),
-        p99_ms=float(np.percentile(arr, 99)),
-        mean_ms=float(np.mean(arr)),
-        num_samples=len(latencies),
+        seq_len=kv_len,
+        num_rounds=len(cost_times),
+        cost_ms=cost_trim,
+        cost_mean_ms=cost_mean,
+        prefill_ms=prefill_trim,
+        prefill_mean_ms=prefill_mean,
+        per_token_ms=pt_trim,
+        per_token_mean_ms=pt_mean,
     )
-    if cost_times:
-        ct = np.array(cost_times)
-        result.cost_p50_ms = float(np.percentile(ct, 50))
-        result.cost_p90_ms = float(np.percentile(ct, 90))
-        result.cost_mean_ms = float(np.mean(ct))
-        result.num_cost_samples = len(cost_times)
-    return result
 
 
 def print_table(results: list[BenchResult]) -> None:
-    print("=== Per-Step Forward (≈ RTP-LLM decode_time_per_token) ===")
-    header = (
-        f"{'Mode':<8} {'BS':>4} {'SeqLen':>7} "
-        f"{'p50(ms)':>9} {'p90(ms)':>9} {'p99(ms)':>9} {'mean(ms)':>9} {'N':>5}"
-    )
-    print(header)
-    print("-" * len(header))
-    for r in results:
-        print(
-            f"{r.mode:<8} {r.batch_size:>4} {r.seq_len:>7} "
-            f"{r.p50_ms:>9.2f} {r.p90_ms:>9.2f} {r.p99_ms:>9.2f} "
-            f"{r.mean_ms:>9.2f} {r.num_samples:>5}"
-        )
-    if any(r.num_cost_samples > 0 for r in results):
-        print()
-        print("=== Per-Request Cost Time (≈ RTP-LLM cost_time_us) ===")
-        cost_header = (
+    prefill = [r for r in results if r.mode == "prefill"]
+    decode = [r for r in results if r.mode == "decode"]
+
+    if prefill:
+        print("=== Prefill (trimmed mean over rounds, "
+              "≈ RTP-LLM first_token_cost_time) ===")
+        header = (
             f"{'Mode':<8} {'BS':>4} {'SeqLen':>7} "
-            f"{'p50(ms)':>9} {'p90(ms)':>9} {'mean(ms)':>9} {'N':>5}"
+            f"{'prefill(ms)':>12} {'mean(ms)':>9} {'rounds':>7}"
         )
-        print(cost_header)
-        print("-" * len(cost_header))
-        for r in results:
+        print(header)
+        print("-" * len(header))
+        for r in prefill:
             print(
                 f"{r.mode:<8} {r.batch_size:>4} {r.seq_len:>7} "
-                f"{r.cost_p50_ms:>9.2f} {r.cost_p90_ms:>9.2f} "
-                f"{r.cost_mean_ms:>9.2f} {r.num_cost_samples:>5}"
+                f"{r.prefill_ms:>12.2f} {r.prefill_mean_ms:>9.2f} "
+                f"{r.num_rounds:>7}"
             )
-    decode_results = [r for r in results
-                      if r.mode == "decode" and r.prefill_mean_ms > 0]
-    if decode_results:
-        print()
-        print("=== Decode Breakdown "
-              "(≈ RTP-LLM first_token_cost_time / decode_time_per_token) ===")
-        bd_header = (
-            f"{'BS':>4} {'SeqLen':>7} "
-            f"{'prefill(ms)':>12} {'decode/tok(ms)':>15}"
+
+    if decode:
+        if prefill:
+            print()
+        print("=== Decode (trimmed mean over rounds, "
+              "≈ RTP-LLM grid_perf_test) ===")
+        header = (
+            f"{'Mode':<8} {'BS':>4} {'SeqLen':>7} "
+            f"{'cost(ms)':>9} {'prefill(ms)':>12} "
+            f"{'per_token(ms)':>14} {'mean(ms)':>9} {'rounds':>7}"
         )
-        print(bd_header)
-        print("-" * len(bd_header))
-        for r in decode_results:
+        print(header)
+        print("-" * len(header))
+        for r in decode:
             print(
-                f"{r.batch_size:>4} {r.seq_len:>7} "
-                f"{r.prefill_mean_ms:>12.2f} {r.decode_per_token_mean_ms:>15.2f}"
+                f"{r.mode:<8} {r.batch_size:>4} {r.seq_len:>7} "
+                f"{r.cost_ms:>9.2f} {r.prefill_ms:>12.2f} "
+                f"{r.per_token_ms:>14.2f} {r.per_token_mean_ms:>9.2f} "
+                f"{r.num_rounds:>7}"
             )
 
 
@@ -227,21 +249,17 @@ def write_csv(results: list[BenchResult], path: str) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "mode", "batch_size", "seq_len",
-            "step_p50_ms", "step_p90_ms", "step_p99_ms", "step_mean_ms",
-            "num_step_samples",
-            "cost_p50_ms", "cost_p90_ms", "cost_mean_ms",
-            "num_cost_samples",
-            "prefill_mean_ms", "decode_per_token_mean_ms",
+            "mode", "batch_size", "seq_len", "num_rounds",
+            "cost_ms", "cost_mean_ms",
+            "prefill_ms", "prefill_mean_ms",
+            "per_token_ms", "per_token_mean_ms",
         ])
         for r in results:
             writer.writerow([
-                r.mode, r.batch_size, r.seq_len,
-                f"{r.p50_ms:.2f}", f"{r.p90_ms:.2f}", f"{r.p99_ms:.2f}",
-                f"{r.mean_ms:.2f}", r.num_samples,
-                f"{r.cost_p50_ms:.2f}", f"{r.cost_p90_ms:.2f}",
-                f"{r.cost_mean_ms:.2f}", r.num_cost_samples,
-                f"{r.prefill_mean_ms:.2f}", f"{r.decode_per_token_mean_ms:.2f}",
+                r.mode, r.batch_size, r.seq_len, r.num_rounds,
+                f"{r.cost_ms:.2f}", f"{r.cost_mean_ms:.2f}",
+                f"{r.prefill_ms:.2f}", f"{r.prefill_mean_ms:.2f}",
+                f"{r.per_token_ms:.2f}", f"{r.per_token_mean_ms:.2f}",
             ])
 
 
@@ -374,8 +392,9 @@ def _run_bench_grid(
                         skip_prefill_forward=args.skip_prefill_forward,
                     )
             results.append(r)
-            print(f"  {label}: step_p50={r.p50_ms:.2f}ms "
-                  f"cost_p50={r.cost_p50_ms:.2f}ms")
+            metric = "per_token" if args.mode == "decode" else "prefill"
+            print(f"  {label}: {metric}={r.primary_ms:.2f}ms "
+                  f"cost={r.cost_ms:.2f}ms")
             if use_torch_profile:
                 print(f"  Trace: {profile_output}/{trace_name}.json")
     return results
@@ -439,7 +458,7 @@ def _dp_worker(
         for r in results:
             r.batch_size *= dp_size
         print(f"[DP rank {rank}] "
-              f"step_p50={[f'{r.p50_ms:.2f}' for r in results]} "
+              f"primary={[f'{r.primary_ms:.2f}' for r in results]} "
               f"({elapsed:.1f}s total incl. init)")
         barrier.wait()
         result_queue.put((rank, results))
@@ -515,15 +534,13 @@ def main() -> None:
 
     if len(rank_results) > 1:
         for i, r0 in enumerate(results):
-            peer_p50s = [rank_results[r][i].p50_ms
-                         for r in rank_results if r != 0]
-            for r, p50 in zip(
-                [r for r in rank_results if r != 0], peer_p50s
-            ):
-                diff_pct = abs(p50 - r0.p50_ms) / max(r0.p50_ms, 1e-6) * 100
+            base = r0.primary_ms
+            for r in (r for r in rank_results if r != 0):
+                peer = rank_results[r][i].primary_ms
+                diff_pct = abs(peer - base) / max(base, 1e-6) * 100
                 if diff_pct > 10:
-                    print(f"WARNING: rank {r} p50={p50:.2f}ms vs "
-                          f"rank 0 p50={r0.p50_ms:.2f}ms "
+                    print(f"WARNING: rank {r} primary={peer:.2f}ms vs "
+                          f"rank 0 primary={base:.2f}ms "
                           f"({diff_pct:.0f}% diff) for "
                           f"bs={r0.batch_size} seq={r0.seq_len}")
 
