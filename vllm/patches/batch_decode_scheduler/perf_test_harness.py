@@ -19,6 +19,7 @@ Known differences vs RTP-LLM perf test:
 
 from __future__ import annotations
 
+import importlib
 import os
 import time
 import uuid
@@ -69,11 +70,20 @@ class BenchHarness:
         pipeline_parallel_size: int = 1,
         enable_expert_parallel: bool = False,
         dp_barrier=None,
+        disable_mm: bool = False,
     ):
         self._dp_barrier = dp_barrier
 
         if dp_barrier is not None:
             self._patch_executor_for_dp_sync(dp_barrier)
+
+        extra_kwargs = {}
+        if disable_mm:
+            # Text-only decode of a VL model: zero the multimodal slots so the
+            # engine's memory-profiling skips the (huge) vision dummy batch and
+            # only the language model is exercised — aligns with RTP-LLM, which
+            # benchmarks these as text (qwen_3_moe).
+            extra_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
 
         self.llm = LLM(
             model=model,
@@ -89,6 +99,7 @@ class BenchHarness:
             pipeline_parallel_size=pipeline_parallel_size,
             enable_expert_parallel=enable_expert_parallel,
             additional_config={"gdn_prefill_backend": "triton"},
+            **extra_kwargs,
         )
 
         if dp_barrier is not None:
@@ -283,6 +294,155 @@ class BenchHarness:
             yield prof
         trace_path = os.path.join(output_dir, f"{trace_name}.json")
         prof.export_chrome_trace(trace_path)
+
+    def _get_model(self):
+        """Return the nn.Module model, or None if not directly accessible.
+
+        Only InprocExecutor (TP=1) exposes driver_worker; MultiprocExecutor
+        (TP>1) runs workers in subprocesses.
+        """
+        if not hasattr(self.executor, "driver_worker"):
+            return None
+        return self.executor.driver_worker.model_runner.model
+
+    def register_scope_hooks(self) -> int:
+        """Wrap Attention/MoE/Norm/RoPE module forwards in record_function ranges.
+
+        Emits Kineto ``user_annotation`` scopes (attn/moe/norm/rope) that line up
+        with RTP-LLM's at::RecordFunction scopes. Returns the number of hooked
+        modules (0 if unavailable). NOTE: scopes only fire in enforce-eager —
+        CUDA-graph replay bypasses the Python forward, so hooks won't run.
+        """
+        from torch.profiler import record_function
+
+        model = self._get_model()
+        if model is None:
+            print("WARNING: --scopes needs TP=1 (InprocExecutor); "
+                  "skipping scope hooks, kernel classification still works")
+            return 0
+
+        matchers: list[tuple[type, str]] = []
+
+        def _try(path: str, attr: str, name: str) -> None:
+            try:
+                mod = importlib.import_module(path)
+                cls = getattr(mod, attr, None)
+                if isinstance(cls, type):
+                    matchers.append((cls, name))
+            except Exception:
+                pass
+
+        # Precise leaf-op classes (no nesting → no double-counting). MoE's
+        # public ``FusedMoE`` is a factory function, so target the concrete
+        # ``RoutedExperts`` module the factory builds.
+        _try("vllm.model_executor.layers.attention", "Attention", "attn")
+        _try("vllm.model_executor.layers.fused_moe.routed_experts",
+             "RoutedExperts", "moe")
+        _try("vllm.model_executor.layers.layernorm", "RMSNorm", "norm")
+        _try("vllm.model_executor.layers.rotary_embedding.base",
+             "RotaryEmbeddingBase", "rope")
+        if not matchers:
+            return 0
+        classes = tuple(c for c, _ in matchers)
+        print(f"Scope classes resolved: {[n for _, n in matchers]}")
+
+        self._scope_handles = []
+        self._scope_active: dict = {}
+
+        def pre_hook(module, args, kwargs):
+            for cls, name in matchers:
+                if isinstance(module, cls):
+                    rf = record_function(name)
+                    rf.__enter__()
+                    self._scope_active[module] = rf
+                    return
+
+        def post_hook(module, args, kwargs, output):
+            rf = self._scope_active.pop(module, None)
+            if rf is not None:
+                rf.__exit__(None, None, None)
+
+        count = 0
+        for _, m in model.named_modules():
+            if isinstance(m, classes):
+                self._scope_handles.append(
+                    m.register_forward_pre_hook(pre_hook, with_kwargs=True))
+                self._scope_handles.append(
+                    m.register_forward_hook(post_hook, with_kwargs=True))
+                count += 1
+        return count
+
+    def remove_scope_hooks(self) -> None:
+        for h in getattr(self, "_scope_handles", []):
+            h.remove()
+        self._scope_handles = []
+        self._scope_active = {}
+
+    def profile_run(
+        self,
+        batch_size: int,
+        seq_len: int,
+        mode: str,
+        num_steps: int,
+        output_dir: str,
+        scopes: bool = False,
+        skip_prefill_forward: bool = False,
+    ) -> str:
+        """Dedicated profiling pass — warmup, then capture a clean trace.
+
+        For decode, prefill runs OUTSIDE the profiler window so the trace holds
+        exactly ``num_steps`` decode steps (per-step averages are then exact).
+        With ``skip_prefill_forward`` the prefill forward is skipped entirely
+        (fake KV via submit_decode_only) — needed at large BS where a real
+        prefill would OOM, and matches RTP-LLM's decode-only setup. For prefill,
+        ``num_steps`` is 1. Trace name encodes mode/bs/seq/steps so
+        perf_test_timeline can recover num_steps. Returns the trace path.
+        """
+        trace_name = f"vllm_{mode}_bs{batch_size}_seq{seq_len}_steps{num_steps}"
+        hooked = self.register_scope_hooks() if scopes else 0
+        if scopes:
+            print(f"Scope hooks registered on {hooked} modules")
+
+        if mode == "prefill":
+            # warmup
+            self.submit(batch_size, seq_len, max_tokens=1)
+            self.run_step_no_timing()
+            self.drain()
+            self.submit(batch_size, seq_len, max_tokens=1)
+            with self.torch_profile(output_dir, trace_name):
+                self.run_step_no_timing()
+            self.drain()
+        elif skip_prefill_forward:
+            # Decode-only: fake KV, no prefill forward at all.
+            self.submit_decode_only(batch_size, seq_len, num_steps)
+            for _ in range(min(2, num_steps)):
+                self.run_step_no_timing()
+            self.drain()
+            self.submit_decode_only(batch_size, seq_len, num_steps)
+            with self.torch_profile(output_dir, trace_name):
+                for _ in range(num_steps):
+                    self.run_step_no_timing()
+            self.drain()
+        else:
+            # warmup: a full prefill + a couple decode steps
+            self.submit(batch_size, seq_len,
+                        max_tokens=num_steps + 1, ignore_eos=True)
+            self.run_step_no_timing()
+            for _ in range(min(2, num_steps)):
+                self.run_step_no_timing()
+            self.drain()
+            # measured: prefill outside window, decode steps inside
+            self.submit(batch_size, seq_len,
+                        max_tokens=num_steps + 1, ignore_eos=True)
+            self.run_step_no_timing()  # prefill (excluded from trace)
+            with self.torch_profile(output_dir, trace_name):
+                for _ in range(num_steps):
+                    self.run_step_no_timing()
+            self.drain()
+
+        if scopes:
+            self.remove_scope_hooks()
+        return os.path.join(output_dir, f"{trace_name}.json")
 
     def submit_decode_only(
         self,

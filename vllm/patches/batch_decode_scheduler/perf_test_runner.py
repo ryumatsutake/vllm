@@ -20,7 +20,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import contextlib
 import csv
 import multiprocessing
 import os
@@ -30,9 +29,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
-def _nullcontext():
-    return contextlib.nullcontext()
 
 from vllm.patches.batch_decode_scheduler.perf_test_harness import BenchHarness
 
@@ -308,6 +304,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip prefill forward in decode mode (hack KV blocks, align with RTP-LLM)",
     )
     parser.add_argument(
+        "--disable-mm", action="store_true",
+        help="Text-only decode of a VL model: zero multimodal slots so the "
+        "engine skips vision profiling (aligns with RTP-LLM's text benchmark).",
+    )
+    parser.add_argument(
         "--profile", action="store_true",
         help="Enable profiling (nsys cudaProfilerApi or torch.profiler)",
     )
@@ -323,7 +324,34 @@ def parse_args() -> argparse.Namespace:
         "--profile-output", default=None,
         help="Output dir for torch profiler traces (default: ./profile_output)",
     )
+    parser.add_argument(
+        "--scopes", action="store_true",
+        help="Inject record_function scopes (attn/moe/norm/rope) via forward "
+        "hooks for a semantic timeline. Requires --enforce-eager (CUDA-graph "
+        "replay bypasses Python forwards, so scopes won't fire otherwise).",
+    )
+    parser.add_argument(
+        "--analyze", action="store_true",
+        help="After a torch-profile pass, print the per-category kernel "
+        "breakdown (perf_test_timeline).",
+    )
+    parser.add_argument(
+        "--rtp-trace", default=None,
+        help="Path to an RTP-LLM chrome trace; prints a per-category "
+        "per-step vLLM-vs-RTP diff after profiling.",
+    )
     return parser.parse_args()
+
+
+def _apply_scope_env(args: argparse.Namespace) -> None:
+    """Enable vLLM custom (record_function) scopes and warn about CUDA graph."""
+    if not args.scopes:
+        return
+    os.environ["VLLM_CUSTOM_SCOPES_FOR_PROFILING"] = "1"
+    if not args.enforce_eager:
+        print("WARNING: --scopes without --enforce-eager: scopes won't fire "
+              "during CUDA-graph replay. Add --enforce-eager for semantic "
+              "scopes (kernel-category breakdown still works either way).")
 
 
 def _run_bench_grid(
@@ -348,6 +376,7 @@ def _run_bench_grid(
         pipeline_parallel_size=args.pp_size,
         enable_expert_parallel=args.enable_expert_parallel,
         dp_barrier=dp_barrier,
+        disable_mm=args.disable_mm,
     )
     print(f"Harness ready in {time.time() - t0:.1f}s")
 
@@ -369,34 +398,46 @@ def _run_bench_grid(
             label = f"{args.mode} bs={bs} seq_len={seq_len}"
             print(f"Running {label} ...")
 
-            trace_name = f"vllm_{args.mode}_bs{bs}_seq{seq_len}"
-            ctx = (harness.torch_profile(profile_output, trace_name)
-                   if use_torch_profile
-                   else _nullcontext())
-
-            with ctx:
-                if args.mode == "prefill":
-                    r = run_prefill_bench(
-                        harness, bs, seq_len,
-                        args.num_iters, args.num_warmup_iters,
-                        profile=use_nsys_profile,
-                        profile_steps=args.profile_steps,
-                    )
-                else:
-                    r = run_decode_bench(
-                        harness, bs, seq_len,
-                        args.num_decode_steps,
-                        args.num_iters, args.num_warmup_iters,
-                        profile=use_nsys_profile,
-                        profile_steps=args.profile_steps,
-                        skip_prefill_forward=args.skip_prefill_forward,
-                    )
+            # Timing pass (nsys profiling, if any, piggybacks here).
+            if args.mode == "prefill":
+                r = run_prefill_bench(
+                    harness, bs, seq_len,
+                    args.num_iters, args.num_warmup_iters,
+                    profile=use_nsys_profile,
+                    profile_steps=args.profile_steps,
+                )
+            else:
+                r = run_decode_bench(
+                    harness, bs, seq_len,
+                    args.num_decode_steps,
+                    args.num_iters, args.num_warmup_iters,
+                    profile=use_nsys_profile,
+                    profile_steps=args.profile_steps,
+                    skip_prefill_forward=args.skip_prefill_forward,
+                )
             results.append(r)
             metric = "per_token" if args.mode == "decode" else "prefill"
             print(f"  {label}: {metric}={r.primary_ms:.2f}ms "
                   f"cost={r.cost_ms:.2f}ms")
+
+            # Dedicated torch-profile pass for per-component breakdown.
             if use_torch_profile:
-                print(f"  Trace: {profile_output}/{trace_name}.json")
+                steps = args.num_decode_steps if args.mode == "decode" else 1
+                trace = harness.profile_run(
+                    bs, seq_len, args.mode, steps,
+                    profile_output, scopes=args.scopes,
+                    skip_prefill_forward=args.skip_prefill_forward,
+                )
+                print(f"  Trace: {trace}")
+                if args.analyze or args.rtp_trace:
+                    from vllm.patches.batch_decode_scheduler.perf_test_timeline import (  # noqa: E501
+                        analyze_file, compare,
+                    )
+                    if args.analyze:
+                        analyze_file(trace, steps)
+                    if args.rtp_trace:
+                        compare(trace, args.rtp_trace, "vLLM", "RTP-LLM",
+                                steps_a=steps)
     return results
 
 
@@ -431,6 +472,7 @@ def _dp_worker(
 ) -> None:
     """Worker process for one DP rank."""
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    _apply_scope_env(args)
 
     if use_dp_env:
         # Cross-DP EP mode: let vLLM handle GPU assignment via
@@ -473,6 +515,7 @@ def main() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     args = parse_args()
+    _apply_scope_env(args)
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
     dp_size = args.dp_size
