@@ -69,11 +69,20 @@ class BenchHarness:
         pipeline_parallel_size: int = 1,
         enable_expert_parallel: bool = False,
         dp_barrier=None,
+        disable_mm: bool = False,
     ):
         self._dp_barrier = dp_barrier
 
         if dp_barrier is not None:
             self._patch_executor_for_dp_sync(dp_barrier)
+
+        extra_kwargs = {}
+        if disable_mm:
+            # Text-only decode of a VL model: zero the multimodal slots so the
+            # engine's memory-profiling skips the (huge) vision dummy batch and
+            # only the language model is exercised — aligns with RTP-LLM, which
+            # benchmarks these as text (qwen_3_moe).
+            extra_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
 
         self.llm = LLM(
             model=model,
@@ -89,6 +98,7 @@ class BenchHarness:
             pipeline_parallel_size=pipeline_parallel_size,
             enable_expert_parallel=enable_expert_parallel,
             additional_config={"gdn_prefill_backend": "triton"},
+            **extra_kwargs,
         )
 
         if dp_barrier is not None:
@@ -283,6 +293,66 @@ class BenchHarness:
             yield prof
         trace_path = os.path.join(output_dir, f"{trace_name}.json")
         prof.export_chrome_trace(trace_path)
+
+    def profile_run(
+        self,
+        batch_size: int,
+        seq_len: int,
+        mode: str,
+        num_steps: int,
+        output_dir: str,
+        skip_prefill_forward: bool = False,
+    ) -> str:
+        """Dedicated profiling pass — warmup, then capture a clean trace.
+
+        For decode, prefill runs OUTSIDE the profiler window so the trace holds
+        exactly ``num_steps`` decode steps (per-step averages are then exact).
+        With ``skip_prefill_forward`` the prefill forward is skipped entirely
+        (fake KV via submit_decode_only) — needed at large BS where a real
+        prefill would OOM, and matches RTP-LLM's decode-only setup. For prefill,
+        ``num_steps`` is 1. Trace name encodes mode/bs/seq/steps so
+        perf_test_timeline can recover num_steps. Returns the trace path.
+        """
+        trace_name = f"vllm_{mode}_bs{batch_size}_seq{seq_len}_steps{num_steps}"
+
+        if mode == "prefill":
+            # warmup
+            self.submit(batch_size, seq_len, max_tokens=1)
+            self.run_step_no_timing()
+            self.drain()
+            self.submit(batch_size, seq_len, max_tokens=1)
+            with self.torch_profile(output_dir, trace_name):
+                self.run_step_no_timing()
+            self.drain()
+        elif skip_prefill_forward:
+            # Decode-only: fake KV, no prefill forward at all.
+            self.submit_decode_only(batch_size, seq_len, num_steps)
+            for _ in range(min(2, num_steps)):
+                self.run_step_no_timing()
+            self.drain()
+            self.submit_decode_only(batch_size, seq_len, num_steps)
+            with self.torch_profile(output_dir, trace_name):
+                for _ in range(num_steps):
+                    self.run_step_no_timing()
+            self.drain()
+        else:
+            # warmup: a full prefill + a couple decode steps
+            self.submit(batch_size, seq_len,
+                        max_tokens=num_steps + 1, ignore_eos=True)
+            self.run_step_no_timing()
+            for _ in range(min(2, num_steps)):
+                self.run_step_no_timing()
+            self.drain()
+            # measured: prefill outside window, decode steps inside
+            self.submit(batch_size, seq_len,
+                        max_tokens=num_steps + 1, ignore_eos=True)
+            self.run_step_no_timing()  # prefill (excluded from trace)
+            with self.torch_profile(output_dir, trace_name):
+                for _ in range(num_steps):
+                    self.run_step_no_timing()
+            self.drain()
+
+        return os.path.join(output_dir, f"{trace_name}.json")
 
     def submit_decode_only(
         self,

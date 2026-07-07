@@ -186,7 +186,45 @@ python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   --profile --profile-mode torch --profile-output /tmp/traces
 ```
 
-输出 `/tmp/traces/vllm_decode_bs1_seq128.json`，用 `chrome://tracing` 或 Perfetto 查看。
+输出 `/tmp/traces/vllm_decode_bs1_seq128_steps10.json`，用 `chrome://tracing` 或 Perfetto 查看。
+trace 名里编码了 `mode/bs/seq/steps`，分析器据此还原每步平均耗时。
+
+### 方式 C：逐组件耗时分解 & 与 RTP 对齐（perf_test_timeline）
+
+`--profile --profile-mode torch` 会走一次**专用 profiling pass**（warmup → 只抓 decode
+步，prefill 在窗口外），产出干净的 chrome trace。加 `--analyze` 直接打印**按组件分类的
+GPU 耗时**（Attention / MoE GEMM / Dense GEMM / Norm / RoPE / Activation / Sampling /
+Comm …，分类法与 RTP `analyze_timeline.py` 对齐）。
+
+```bash
+# CUDA graph 下的逐组件 GPU 耗时（分类靠 kernel 名，CUDA graph 也准）
+python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3-8B/ --mode decode \
+  --batch-sizes 4 --seq-lens 128 --num-iters 3 --num-decode-steps 10 \
+  --max-model-len 4096 --dtype bfloat16 --gpu-memory-utilization 0.6 \
+  --profile --profile-mode torch --profile-output /tmp/traces --analyze
+```
+
+**VL 模型（如 Qwen3.5-35B-A3B-FP8）需加 `--disable-mm`**：把多模态槽位清零,让引擎跳过
+视觉塔的显存 profiling,只跑语言模型 decode（和 RTP 的 text 基准对齐）。否则会在 vision
+dummy batch 处崩。
+
+**单独分析 / 两引擎对比**（analyzer 可独立跑）：
+
+```bash
+# 单个 trace 的分类分解
+python -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
+  /tmp/traces/vllm_decode_bs4_seq128_steps10.json
+
+# vLLM ↔ RTP 逐组件每步 diff（RTP trace 见下方 RTP Profiling 对照）
+python -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
+  --compare vllm.json rtp.json --labels vLLM RTP-LLM
+# 或在跑 vLLM 时直接对比：给 runner 加 --rtp-trace rtp.json
+```
+
+说明：CUDA graph + torch.compile 会把 RoPE/Norm/残差融进匿名 `triton_*_fused` kernel，
+归到 **Fused (compile)** 桶；要看清 RoPE/Norm/Activation 用 `--enforce-eager`（禁融合，
+kernel 名恢复语义）。
 
 ### RTP-LLM Profiling 对照
 
