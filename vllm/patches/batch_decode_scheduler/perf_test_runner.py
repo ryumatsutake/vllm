@@ -329,13 +329,9 @@ def _run_bench_grid(
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        dp_barrier=dp_barrier,
     )
     print(f"Harness ready in {time.time() - t0:.1f}s")
-
-    # With EP, execute_model requires all DP ranks to participate in
-    # all-to-all. Barrier ensures all ranks enter warmup/bench together.
-    if dp_barrier is not None:
-        dp_barrier.wait()
 
     min_seq = min(seq_lens)
     print(f"Global warmup (bs=1, seq_len={min_seq}) ...")
@@ -479,10 +475,6 @@ def main() -> None:
             )
 
     use_dp_env = args.enable_expert_parallel and _detect_moe(args.model)
-    if use_dp_env and not args.enforce_eager:
-        print("EP+DP: forcing --enforce-eager (CUDA graphs deadlock "
-              "with cross-DP NCCL collectives)")
-        args.enforce_eager = True
     print(f"DP mode: {'EP (VLLM_DP env vars)' if use_dp_env else 'independent (CUDA_VISIBLE_DEVICES)'}, "
           f"dp_size={dp_size}")
 
