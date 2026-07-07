@@ -12,8 +12,9 @@ Known differences vs RTP-LLM perf test:
   models for stable benchmarks. vLLM has no equivalent; expert routing
   follows the model's gating network. This may cause variance in MoE
   decode latency across runs.
-- No DP support: harness uses InprocClient (single EngineCore process).
-  DP+EP scenarios (e.g. DeepSeek-V4 DP=4 EP=4) are not supported.
+- DP via runner only: harness itself is single-process (InprocClient).
+  DP is supported by the runner, which spawns one harness per DP rank.
+  See perf_test_runner.py --dp-size for DP+EP benchmarks.
 """
 
 from __future__ import annotations
@@ -246,7 +247,15 @@ class BenchHarness:
         """Register requests in model_runner without running forward.
 
         Handles both V1 (_update_states) and V2 (finish/add/update) model runners.
+        Only works with InprocExecutor (TP=1). MultiprocExecutor (TP>1) runs
+        workers in subprocesses where driver_worker is not directly accessible.
         """
+        if not hasattr(self.executor, 'driver_worker'):
+            raise RuntimeError(
+                "--skip-prefill-forward is not supported with TP>1. "
+                "MultiprocExecutor does not expose driver_worker. "
+                "Use normal prefill (remove --skip-prefill-forward) instead."
+            )
         worker = self.executor.driver_worker
         model_runner = worker.model_runner
         if hasattr(model_runner, '_update_states'):
