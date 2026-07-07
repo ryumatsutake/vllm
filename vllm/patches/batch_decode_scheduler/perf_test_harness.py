@@ -253,6 +253,16 @@ class BenchHarness:
         torch.cuda.synchronize()
         return (time.perf_counter() - self._batch_start) * 1000
 
+    def mark_lap(self) -> float:
+        """Elapsed ms since batch start (after cuda sync), without resetting.
+
+        Splits a decode round into prefill (first token) vs decode without
+        disturbing the batch-start clock, so prefill and cost share one
+        origin. Aligns with RTP-LLM first_token_cost_time.
+        """
+        torch.cuda.synchronize()
+        return (time.perf_counter() - self._batch_start) * 1000
+
     def start_profiling(self) -> None:
         """Signal nsys to start capture (requires --capture-range=cudaProfilerApi)."""
         torch.cuda.cudart().cudaProfilerStart()
