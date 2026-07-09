@@ -36,6 +36,29 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
 
 
+def _force_vllm_scopes() -> None:
+    """Force vLLM's built-in record_function scopes on, robustly.
+
+    vLLM gates its ``gpu_model_runner:`` / ``schedule:`` scopes behind
+    ``record_function_or_nullcontext`` (vllm/v1/utils.py), which freezes its
+    choice into a module global ``_PROFILER_FUNC`` on the FIRST call. If that
+    first call happened before VLLM_CUSTOM_SCOPES_FOR_PROFILING was visible, the
+    global sticks at ``nullcontext`` forever. We overwrite ``_PROFILER_FUNC`` so
+    all scopes emit real record_function ranges regardless of first-call timing.
+
+    NOTE: the ``gpu_model_runner:`` scopes only exist in vLLM's *legacy V1* model
+    runner (vllm/v1/worker/gpu_model_runner.py). The V2 runner
+    (vllm/v1/worker/gpu/model_runner.py, default for archs in
+    DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES — Qwen3/Llama/Mistral/...) has no
+    scopes. The ``--vllm-scopes`` runner flag sets VLLM_USE_V2_MODEL_RUNNER=0 so
+    the scoped V1 runner is used; this function only handles the on/off gating.
+    """
+    import vllm.v1.utils as U
+    from torch.autograd.profiler import record_function
+
+    U._PROFILER_FUNC = record_function
+
+
 @dataclass
 class StepStat:
     forward_ms: float
@@ -285,6 +308,10 @@ class BenchHarness:
     def torch_profile(self, output_dir: str, trace_name: str = "vllm_bench"):
         """Wrap steps with torch.profiler for Kineto Chrome Trace output."""
         os.makedirs(output_dir, exist_ok=True)
+        if os.environ.get("VLLM_CUSTOM_SCOPES_FOR_PROFILING") == "1":
+            _force_vllm_scopes()
+            if os.environ.get("SCOPE_DEBUG") == "1":
+                self._debug_print_runner()
         activities = [
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
@@ -293,6 +320,17 @@ class BenchHarness:
             yield prof
         trace_path = os.path.join(output_dir, f"{trace_name}.json")
         prof.export_chrome_trace(trace_path)
+
+    def _debug_print_runner(self) -> None:
+        """Print the active model-runner class — V1 (scoped) vs V2 (no scopes)."""
+        try:
+            mr = self.executor.driver_worker.model_runner
+            cls = type(mr)
+            is_v1 = cls.__module__ == "vllm.v1.worker.gpu_model_runner"
+            print(f"[scope] model_runner={cls.__module__}.{cls.__qualname__} "
+                  f"({'V1 scoped' if is_v1 else 'V2 NO scopes'})")
+        except Exception as e:
+            print(f"[scope] runner probe failed: {e}")
 
     def profile_run(
         self,

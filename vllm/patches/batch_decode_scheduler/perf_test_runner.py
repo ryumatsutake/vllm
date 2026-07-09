@@ -309,6 +309,16 @@ def parse_args() -> argparse.Namespace:
         "engine skips vision profiling (aligns with RTP-LLM's text benchmark).",
     )
     parser.add_argument(
+        "--vllm-scopes", action="store_true",
+        help="Enable vLLM's built-in engine-phase record_function scopes "
+        "(gpu_model_runner: forward/sample/..., schedule: ...) as user_annotation "
+        "in the torch trace. Sets VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 AND "
+        "VLLM_USE_V2_MODEL_RUNNER=0 — the gpu_model_runner: scopes exist ONLY in "
+        "the legacy V1 runner; the V2 runner (default for Qwen3/Llama/Mistral/... "
+        "per DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES) has none. Eager only; "
+        "negligible CPU overhead so use with --profile.",
+    )
+    parser.add_argument(
         "--profile", action="store_true",
         help="Enable profiling (nsys cudaProfilerApi or torch.profiler)",
     )
@@ -455,6 +465,9 @@ def _dp_worker(
 ) -> None:
     """Worker process for one DP rank."""
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if args.vllm_scopes:
+        os.environ.setdefault("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "1")
+        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
     if use_dp_env:
         # Cross-DP EP mode: let vLLM handle GPU assignment via
@@ -497,6 +510,9 @@ def main() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     args = parse_args()
+    if args.vllm_scopes:
+        os.environ.setdefault("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "1")
+        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
     dp_size = args.dp_size
