@@ -91,24 +91,15 @@ def run_prefill_bench(
     seq_len: int,
     num_iters: int,
     num_warmup_iters: int = 1,
-    profile: bool = False,
-    profile_steps: int = 3,
 ) -> BenchResult:
     cost_times: list[float] = []
     total = num_warmup_iters + num_iters
-    profiled = 0
     for i in range(total):
         harness.submit(batch_size, seq_len, max_tokens=1)
         harness.mark_batch_start()
-        if profile and i >= num_warmup_iters and profiled < profile_steps:
-            if profiled == 0:
-                harness.start_profiling()
-            profiled += 1
         stat = harness.run_step()
         harness.assert_phase(stat, "prefill")
-        if profile and profiled == profile_steps:
-            harness.stop_profiling()
-            profiled += 1  # prevent re-stop
+        harness.assert_batch(stat, batch_size)
         # Wall time of the single prefill step (≈ RTP first_token_cost_time).
         cost_ms = harness.mark_batch_end()
         if i >= num_warmup_iters:
@@ -134,15 +125,13 @@ def run_decode_bench(
     num_decode_steps: int,
     num_iters: int,
     num_warmup_iters: int = 1,
-    profile: bool = False,
-    profile_steps: int = 3,
     skip_prefill_forward: bool = False,
+    worker_profile: bool = False,
 ) -> BenchResult:
     cost_times: list[float] = []
     prefill_times: list[float] = []
     per_token_times: list[float] = []
     total = num_warmup_iters + num_iters
-    profiled = 0
     for i in range(total):
         prefill_ms = 0.0
         if skip_prefill_forward:
@@ -159,20 +148,22 @@ def run_decode_bench(
             harness.mark_batch_start()
             setup_stat = harness.run_step()
             harness.assert_phase(setup_stat, "prefill")
+            harness.assert_batch(setup_stat, batch_size)
             # Wall time to first token (≈ RTP first_token_cost_time), on the
             # same batch-start clock as cost below.
             prefill_ms = harness.mark_lap()
+        # WorkerProfiler: capture exactly the decode loop of the first measured
+        # round (warmup rounds excluded), so the trace holds num_decode_steps
+        # decode steps and nothing else.
+        wprof_this = worker_profile and i == num_warmup_iters
+        if wprof_this:
+            harness.start_worker_profile()
         for step in range(num_decode_steps):
-            if (profile and i >= num_warmup_iters
-                    and profiled < profile_steps):
-                if profiled == 0:
-                    harness.start_profiling()
-                profiled += 1
             stat = harness.run_step()
             harness.assert_phase(stat, "decode")
-            if profile and profiled == profile_steps:
-                harness.stop_profiling()
-                profiled += 1
+            harness.assert_batch(stat, batch_size)
+        if wprof_this:
+            harness.stop_worker_profile()
         # Whole round, begin -> last token (≈ RTP cost_time).
         cost_ms = harness.mark_batch_end()
         if i >= num_warmup_iters:
@@ -319,16 +310,18 @@ def parse_args() -> argparse.Namespace:
         "negligible CPU overhead so use with --profile.",
     )
     parser.add_argument(
+        "--worker-profile-dir", default=None,
+        help="Use vLLM's built-in WorkerProfiler (torch backend). Fans out to "
+        "every TP/DP rank via collective_rpc (each dumps its own trace to this "
+        "dir). Decode mode only; wraps the decode loop of the first measured "
+        "round. Use for TP>1, where --profile's single-process torch.profiler "
+        "can't see the worker subprocesses.",
+    )
+    parser.add_argument(
         "--profile", action="store_true",
-        help="Enable profiling (nsys cudaProfilerApi or torch.profiler)",
-    )
-    parser.add_argument(
-        "--profile-mode", default="nsys", choices=["nsys", "torch"],
-        help="Profile backend: nsys (requires nsys wrapper) or torch (Kineto trace)",
-    )
-    parser.add_argument(
-        "--profile-steps", type=int, default=3,
-        help="Number of steps to capture in profile window",
+        help="Run a dedicated torch.profiler pass (Kineto chrome trace) after "
+        "the timing pass. Lightweight, zero engine config, single-process "
+        "(TP=1). For TP>1 multi-rank traces use --worker-profile-dir instead.",
     )
     parser.add_argument(
         "--profile-output", default=None,
@@ -355,13 +348,15 @@ def _run_bench_grid(
 ) -> list[BenchResult]:
     """Run the full benchmark grid on the current process. Returns results."""
     max_batch_size = max(batch_sizes)
+    max_seq_len = max(seq_lens)
     print(f"Initializing harness (model={args.model}, "
-          f"max_batch_size={max_batch_size}) ...")
+          f"max_batch_size={max_batch_size}, max_seq_len={max_seq_len}) ...")
     t0 = time.time()
     harness = BenchHarness(
         model=args.model,
         max_batch_size=max_batch_size,
         max_model_len=args.max_model_len,
+        max_seq_len=max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
         enforce_eager=args.enforce_eager,
@@ -370,6 +365,7 @@ def _run_bench_grid(
         enable_expert_parallel=args.enable_expert_parallel,
         dp_barrier=dp_barrier,
         disable_mm=args.disable_mm,
+        worker_profiler_dir=args.worker_profile_dir,
     )
     print(f"Harness ready in {time.time() - t0:.1f}s")
 
@@ -381,8 +377,7 @@ def _run_bench_grid(
     harness.drain()
     print("Global warmup done")
 
-    use_nsys_profile = args.profile and args.profile_mode == "nsys"
-    use_torch_profile = args.profile and args.profile_mode == "torch"
+    use_torch_profile = args.profile
     profile_output = args.profile_output or "./profile_output"
 
     results: list[BenchResult] = []
@@ -391,22 +386,19 @@ def _run_bench_grid(
             label = f"{args.mode} bs={bs} seq_len={seq_len}"
             print(f"Running {label} ...")
 
-            # Timing pass (nsys profiling, if any, piggybacks here).
+            # Timing pass.
             if args.mode == "prefill":
                 r = run_prefill_bench(
                     harness, bs, seq_len,
                     args.num_iters, args.num_warmup_iters,
-                    profile=use_nsys_profile,
-                    profile_steps=args.profile_steps,
                 )
             else:
                 r = run_decode_bench(
                     harness, bs, seq_len,
                     args.num_decode_steps,
                     args.num_iters, args.num_warmup_iters,
-                    profile=use_nsys_profile,
-                    profile_steps=args.profile_steps,
                     skip_prefill_forward=args.skip_prefill_forward,
+                    worker_profile=bool(args.worker_profile_dir),
                 )
             results.append(r)
             metric = "per_token" if args.mode == "decode" else "prefill"

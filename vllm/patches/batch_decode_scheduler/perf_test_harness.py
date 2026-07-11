@@ -85,6 +85,7 @@ class BenchHarness:
         max_batch_size: int,
         *,
         max_model_len: int = 8192,
+        max_seq_len: int | None = None,
         gpu_memory_utilization: float = 0.9,
         dtype: str = "auto",
         enforce_eager: bool = False,
@@ -93,13 +94,40 @@ class BenchHarness:
         enable_expert_parallel: bool = False,
         dp_barrier=None,
         disable_mm: bool = False,
+        worker_profiler_dir: str | None = None,
     ):
         self._dp_barrier = dp_barrier
+
+        # Token budget must admit the largest single-step batch without chunking:
+        # both real prefill and the fake-KV decode-only setup go through a real
+        # scheduler.schedule() that prefills batch * seq_len tokens in one step.
+        # The bound is max_batch_size * max_seq_len (the largest seq_len across
+        # the grid), NOT max_batch_size * max_model_len. profile_run does a
+        # skip_attn dummy forward at exactly this many tokens (gpu_worker.py's
+        # determine_available_memory), so an over-large budget inflates the
+        # measured activation peak, steals KV memory, and can OOM profiling at
+        # large batch. Floor at max_model_len: vLLM rejects
+        # max_num_batched_tokens < max_model_len when chunked prefill is off
+        # (config/scheduler.py verify_max_model_len).
+        if max_seq_len is None:
+            max_seq_len = max_model_len
+        max_num_batched_tokens = max(max_batch_size * max_seq_len, max_model_len)
 
         if dp_barrier is not None:
             self._patch_executor_for_dp_sync(dp_barrier)
 
         extra_kwargs = {}
+        if worker_profiler_dir:
+            # Use vLLM's built-in WorkerProfiler (torch backend). Unlike the
+            # harness's own torch_profile (single-process, TP=1 only), this fans
+            # out to every TP/DP rank via collective_rpc, so each rank dumps its
+            # own trace — needed for TP>1 where the driver-process profiler can't
+            # see the worker subprocesses.
+            from vllm.config.profiler import ProfilerConfig
+            extra_kwargs["profiler_config"] = ProfilerConfig(
+                profiler="torch",
+                torch_profiler_dir=worker_profiler_dir,
+            )
         if disable_mm:
             # Text-only decode of a VL model: zero the multimodal slots so the
             # engine's memory-profiling skips the (huge) vision dummy batch and
@@ -115,7 +143,7 @@ class BenchHarness:
             enable_chunked_prefill=False,
             enable_prefix_caching=False,
             max_num_seqs=max_batch_size,
-            max_num_batched_tokens=max_batch_size * max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
             dtype=dtype,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
@@ -276,6 +304,25 @@ class BenchHarness:
                 f"{stat.num_scheduled_tokens}/{stat.num_reqs})"
             )
 
+    def assert_batch(self, stat: StepStat, expected_bs: int) -> None:
+        """Assert schedule() batched all expected_bs requests in this step.
+
+        assert_phase only checks the phase of the *scheduled subset*, so a
+        partially-scheduled batch (e.g. allocate_slots returns None on KV-cache
+        OOM → scheduler.py breaks early, leaving requests in waiting) still
+        looks like a clean all-prefill/all-decode step and passes phase checks.
+        The timing is then measured on a smaller batch than requested, silently
+        corrupting the result. This guards against that: a benchmark that can't
+        fit the requested batch must fail loudly, not report wrong-batch data.
+        """
+        if stat.num_reqs != expected_bs:
+            raise AssertionError(
+                f"Expected {expected_bs} reqs scheduled together, got "
+                f"{stat.num_reqs} — batch was split (KV-cache OOM or "
+                f"scheduler budget clip). Lower --batch-sizes/--seq-lens or "
+                f"raise --gpu-memory-utilization."
+            )
+
     def mark_batch_start(self) -> None:
         """Record batch start time (after cuda sync). Aligns with RTP-LLM resetBeginTime."""
         torch.cuda.synchronize()
@@ -296,13 +343,13 @@ class BenchHarness:
         torch.cuda.synchronize()
         return (time.perf_counter() - self._batch_start) * 1000
 
-    def start_profiling(self) -> None:
-        """Signal nsys to start capture (requires --capture-range=cudaProfilerApi)."""
-        torch.cuda.cudart().cudaProfilerStart()
+    def start_worker_profile(self) -> None:
+        """Start vLLM's built-in WorkerProfiler on every TP/DP rank."""
+        self.llm.start_profile()
 
-    def stop_profiling(self) -> None:
-        """Signal nsys to stop capture."""
-        torch.cuda.cudart().cudaProfilerStop()
+    def stop_worker_profile(self) -> None:
+        """Stop WorkerProfiler; each rank dumps its trace to torch_profiler_dir."""
+        self.llm.stop_profile()
 
     @contextmanager
     def torch_profile(self, output_dir: str, trace_name: str = "vllm_bench"):
