@@ -301,13 +301,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--vllm-scopes", action="store_true",
-        help="Enable vLLM's built-in engine-phase record_function scopes "
-        "(gpu_model_runner: forward/sample/..., schedule: ...) as user_annotation "
-        "in the torch trace. Sets VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 AND "
-        "VLLM_USE_V2_MODEL_RUNNER=0 — the gpu_model_runner: scopes exist ONLY in "
-        "the legacy V1 runner; the V2 runner (default for Qwen3/Llama/Mistral/... "
-        "per DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES) has none. Eager only; "
-        "negligible CPU overhead so use with --profile.",
+        help="Emit gpu_model_runner: preprocess/sample/postprocess scopes as "
+        "user_annotation in the trace. Sets VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 "
+        "and INJECTS the scopes into the default V2 runner via collective_rpc "
+        "(no longer forces the legacy V1 runner). Works per-rank for TP>1. "
+        "Compose with --profile (TP=1 driver trace) or --worker-profile-dir "
+        "(TP>1 per-rank traces). Add --scope-forward for a forward scope.",
+    )
+    parser.add_argument(
+        "--vllm-scopes-v1", action="store_true",
+        help="Escape hatch: use the legacy V1 runner's NATIVE scopes instead of "
+        "V2 injection. Sets VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 AND "
+        "VLLM_USE_V2_MODEL_RUNNER=0. The injection auto-detects V1 and only "
+        "forces the profiler-func freeze (never double-wraps).",
+    )
+    parser.add_argument(
+        "--scope-forward", action="store_true",
+        help="Also wrap the model forward in a 'gpu_model_runner: forward' "
+        "scope. Under CUDA graphs this measures only HOST launch time, not GPU "
+        "kernel time — use with --enforce-eager for a meaningful forward wall "
+        "time. GPU attribution always comes from the kernel timeline "
+        "(category_breakdown), which works through graphs. Needs --vllm-scopes "
+        "(or --vllm-scopes-v1).",
     )
     parser.add_argument(
         "--worker-profile-dir", default=None,
@@ -366,6 +381,8 @@ def _run_bench_grid(
         dp_barrier=dp_barrier,
         disable_mm=args.disable_mm,
         worker_profiler_dir=args.worker_profile_dir,
+        inject_scopes=(args.vllm_scopes or args.vllm_scopes_v1),
+        scope_forward=args.scope_forward,
     )
     print(f"Harness ready in {time.time() - t0:.1f}s")
 
@@ -426,6 +443,22 @@ def _run_bench_grid(
     return results
 
 
+def _apply_scope_env(args: argparse.Namespace) -> None:
+    """Set scope-related env vars from CLI flags (before engine init).
+
+    --vllm-scopes keeps the default V2 runner and injects scopes at the harness
+    layer. --vllm-scopes-v1 forces the legacy V1 runner for its native scopes.
+    Env vars must be set before workers spawn so they inherit them.
+    """
+    if args.vllm_scopes or args.vllm_scopes_v1:
+        os.environ.setdefault("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "1")
+    if args.vllm_scopes_v1:
+        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    if args.scope_forward and not (args.vllm_scopes or args.vllm_scopes_v1):
+        print("WARNING: --scope-forward needs --vllm-scopes (or "
+              "--vllm-scopes-v1); ignoring --scope-forward.")
+
+
 def _detect_moe(model: str) -> bool:
     """Check if the model is a MoE model by reading its config."""
     from transformers import AutoConfig
@@ -457,9 +490,7 @@ def _dp_worker(
 ) -> None:
     """Worker process for one DP rank."""
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    if args.vllm_scopes:
-        os.environ.setdefault("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "1")
-        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    _apply_scope_env(args)
 
     if use_dp_env:
         # Cross-DP EP mode: let vLLM handle GPU assignment via
@@ -502,9 +533,7 @@ def main() -> None:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     args = parse_args()
-    if args.vllm_scopes:
-        os.environ.setdefault("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "1")
-        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    _apply_scope_env(args)
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
     dp_size = args.dp_size

@@ -223,31 +223,57 @@ python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 视觉塔的显存 profiling,只跑语言模型 decode（和 RTP 的 text 基准对齐）。否则会在 vision
 dummy batch 处崩。
 
-**vLLM 自带引擎阶段 scope（对齐 RTP 的 executor.model_forward / sampler_forward）**：加
-`--vllm-scopes`（需配 `--enforce-eager`）。它会在 torch trace 里输出
-`gpu_model_runner: forward / preprocess / sample / postprocess / bookkeep` 和
-`schedule: ...` 这些 `user_annotation`，`--analyze` 的 "Semantic scopes" 表会列出来。
+**vLLM 引擎阶段 scope（对齐 RTP 的 executor.model_forward / sampler_forward）**：加
+`--vllm-scopes`。它在 torch trace 里输出 `gpu_model_runner: forward / preprocess /
+sample / postprocess / ModelRunnerOutput` 和 `schedule: ...` 这些 `user_annotation`，
+`--analyze` 的 "Semantic scopes" 表会列出来。
 
-坑点（务必知道）：`gpu_model_runner:` 这些 scope **只存在于 vLLM 的 legacy V1 model
-runner**（`vllm/v1/worker/gpu_model_runner.py`）。新的 **V2 runner**
-（`vllm/v1/worker/gpu/model_runner.py`，对 `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES` 里的
-Qwen3/Llama/Mistral/DeepseekV2/... 是默认）**完全没有 record_function scope**——所以直接开
-`VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` 对这些模型只会看到 `schedule:` scope，看不到前向。
-`--vllm-scopes` 因此**同时设 `VLLM_USE_V2_MODEL_RUNNER=0`** 强制走 V1 scoped runner。
-注意这会切换到 legacy 执行路径（时延不代表 V2 部署路径,仅用于 scope 语义对齐）。
-scope 只在 eager 命中,CUDA graph replay 下不触发,时长是 CPU wall（GPU 归因看 kernel 分类表）。
+**V2 runner 现在也有 scope（harness 注入，不再强制回退 V1）**：`gpu_model_runner:` 这些
+scope 原生**只存在于 legacy V1 runner**（`vllm/v1/worker/gpu_model_runner.py`）；新的
+**V2 runner**（`vllm/v1/worker/gpu/model_runner.py`，对 `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`
+里的 Qwen3/Llama/Mistral/DeepseekV2/Qwen2Moe 默认）**原生没有任何 record_function scope**。
+`--vllm-scopes` 现在经 `collective_rpc` 把注入代码发到**每个 worker 进程**，monkey-patch V2
+runner 的 `prepare_inputs`/`sample`/`postprocess_sampled` 和 `AsyncOutput.__init__`，套上与
+V1 同名的 scope。因此**保持真实 V2 部署路径**，且 **TP>1 每个 rank 都能记录**（配
+`--worker-profile-dir`）。天然走 V1 的模型（arch 不在 V2 列表）用其原生 scope——注入会自动
+检测 V1，只破除 profiler-func 冻结、不重复套。
+
+实测（Qwen3.5-35B-A3B, decode 30 步）：V2 注入的 `forward` 与 V1 原生 `forward` 逐值对齐
+（~2.5%），`schedule:` 组一致，`ModelRunnerOutput`（包 `AsyncOutput` 的 D2H）≈ V1 的
+`AsyncGPUModelRunnerOutput`；`preprocess/sample/postprocess` 因 V1/V2 阶段切分不同、注入只
+包内层单个方法（span 更窄/不同）→ **名对齐、可配对，但绝对值不可直接比**（引擎结构差异，非 bug）。
+
+相关开关：
+- `--vllm-scopes`：默认路径，注入 V2（或在天然 V1 的模型上直接用原生 scope）。
+- `--scope-forward`（默认关）：额外套 `gpu_model_runner: forward`。**CUDA graph 下 forward
+  scope 只量到 host 端启动 graph 的时间**（不是 GPU kernel 时间），要有意义的 forward 墙钟配
+  `--enforce-eager`；GPU 归因始终看 kernel 分类表。
+- `--vllm-scopes-v1`（逃生开关）：强制 `VLLM_USE_V2_MODEL_RUNNER=0` 回到 legacy V1 原生
+  scope（含 V1 独有的 `bookkeep`/`eplb`/`AsyncGPUModelRunnerOutput` 等）。注意 V1 是 legacy
+  执行路径，时延不代表 V2 部署。
+
+scope 时长是 CPU 墙钟；CUDA graph replay 下 `forward` 降级为启动时间（GPU 归因看 kernel 分类表）。
 
 ```bash
+# V2 runner + 注入 scope（TP=1，driver 进程 torch.profiler 直接抓 + --analyze 打印 scope 表）
 python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/muxue.xy/Qwen3-32B --mode decode \
-  --batch-sizes 128 --seq-lens 128 --num-iters 3 --num-decode-steps 30 \
-  --max-model-len 256 --gpu-memory-utilization 0.8 \
-  --tp-size 1 --enforce-eager --vllm-scopes \
+  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
+  --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
+  --max-model-len 2048 --gpu-memory-utilization 0.9 \
+  --tp-size 1 --vllm-scopes --scope-forward \
   --profile --profile-output /tmp/traces --analyze
+
+# TP>1：scope 在 worker 子进程，用 --worker-profile-dir 经 collective_rpc 每 rank 各抓一份
+python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
+  --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
+  --max-model-len 2048 --gpu-memory-utilization 0.9 \
+  --tp-size 2 --vllm-scopes --scope-forward \
+  --worker-profile-dir /tmp/wp_trace
 ```
-（`--vllm-scopes` 需要模型在 **单进程**内可见,即 TP=1；TP>1 时前向在 worker 子进程,
-harness 主进程的 torch.profiler 抓不到——改用**方式 B 的 `--worker-profile-dir`**,它经
-`collective_rpc` 到每个 rank 各自抓 trace。）
+（TP=1 用 `--profile`（driver torch.profiler）即可；TP>1 前向在 worker 子进程，driver
+profiler 抓不到，必须用 `--worker-profile-dir`——注入代码已在每个 worker 进程里把 scope
+装好，各 rank 的 trace 里都有。gzip trace 喂 `perf_test_timeline` 的转换见方式 B 坑点。）
 
 **单独分析 / 两引擎对比**（analyzer 可独立跑）：
 
@@ -274,7 +300,7 @@ PyTorch / CUDA 自动，RTP 与 vLLM 机制一样。**
 #### 层一：引擎阶段 scope（手埋）
 
 - vLLM 用 `record_function_or_nullcontext("...")` 埋，由 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1`
-  开；`--vllm-scopes` 会自动设它（并强制 V1，见下）。
+  开；`--vllm-scopes` 会自动设它，并向 V2 runner 注入同名 scope（见下）。
 - 覆盖：`gpu_model_runner: forward/preprocess/postprocess/sample/bookkeep/eplb/draft/...`、
   `schedule: allocate_slots/...`、`llm_engine step: ...`、`ngram_proposer_gpu: kernel`。
 - 性质：**CPU 墙钟、引擎阶段级**（forward 是一整块，不下沉到 attn/moe/gemm）。
@@ -286,17 +312,23 @@ PyTorch / CUDA 自动，RTP 与 vLLM 机制一样。**
   | 采样 | `gpu_model_runner: sample` | `executor.sampler_forward` |
   | 输入准备 | `gpu_model_runner: preprocess` | `executor.gather_model_input` |
   | 输出 | `postprocess`/`ModelRunnerOutput` | `executor.dispatch_output` |
-  | 调度 | `schedule: allocate_slots` | 埋在 `engine.normal.execute` 外层 |
+  | 调度 | `schedule: allocate_slots` | 埋在 `engine.normal.step` 外层（包住 `scheduler_->schedule()`，`CanRun`→RUNNING 后返回，forward 在 `process()` 里）|
 
-- **失效 / 降级条件**：
-  - **V2 runner**（`gpu/model_runner.py`，Qwen3/Llama/Mistral/DeepseekV2/Qwen2Moe 等默认，
-    见 `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`）**没埋任何 scope** → `--vllm-scopes` 会强制
-    `VLLM_USE_V2_MODEL_RUNNER=0` 回到有 scope 的 V1（注意 V1 是 legacy 路径，时延不代表 V2 部署）。
-  - **TP>1**：前向在 worker 子进程，harness 主进程 profiler 抓不到。
-  - **CUDA graph**：引擎 scope 仍触发，但 `forward` 只量到"启动 graph"的 ~1–2ms
-    （实测 121ms→1.9ms），失去前向计算意义（不是消失，是降级）。
-  - **DP + EP（TP=1）+ eager 可用**：每个 DP rank 是独立进程、TP=1 → 模型在进程内可见；
-    需给 trace 加 rank 后缀避免同名覆盖。⚠️ 尚未实测验证。
+  V2 runner 经 harness 注入后 emit 同名 scope（`preprocess`/`sample`/`postprocess`/
+  `ModelRunnerOutput`/`forward`），所以上表对 V2 也成立（`forward`/`schedule` 逐值对齐 V1；
+  `preprocess/sample/postprocess` 名对齐、值因 span 不同而异，见方式 C）。
+
+- **失效 / 降级条件**（V2 与 TP>1 已被 harness 注入解决，见方式 C）：
+  - **V2 runner 原生无 scope** → 已解决：`--vllm-scopes` 经 `collective_rpc` 向每个 worker
+    注入，mirror V1 名，**保持真实 V2 路径**（不再强制回退 V1）。`--vllm-scopes-v1` 可回退
+    legacy V1 原生 scope。
+  - **TP>1** → 已解决：注入在每个 worker 进程内执行，配 `--worker-profile-dir` 每 rank 各抓
+    一份 trace（driver 进程 torch.profiler 仍抓不到 worker，故 TP>1 必须用 worker-profile-dir）。
+  - **CUDA graph**：`forward` scope 仍触发，但只量到"启动 graph"的 host 时间（实测
+    121ms→1.9ms），失去前向计算意义（降级不是消失）；GPU 归因看层三 kernel 分类。
+  - **preprocess/sample/postprocess 的 V1↔V2 数值差异**：V2 注入只包内层单个方法，span 比 V1
+    同名 scope 窄/不同 → 名对齐、值不可直接比（引擎结构差异，非 bug）。
+  - **DP + EP（TP=1）+ eager 可用**：每个 DP rank 独立进程、TP=1 → 模型进程内可见。⚠️ 尚未实测。
 
 #### 层二：算子框架 scope（cpu_op，PyTorch/Kineto 自动）
 

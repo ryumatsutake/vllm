@@ -59,6 +59,134 @@ def _force_vllm_scopes() -> None:
     U._PROFILER_FUNC = record_function
 
 
+# V2 model-runner scope injection (see _install_scope_patches).
+#
+# The V2 runner (vllm/v1/worker/gpu/model_runner.py, default for
+# Qwen3/Llama/Mistral) has NO record_function scopes, unlike the legacy V1
+# runner. We monkey-patch its granular methods to emit the SAME scope names the
+# V1 runner uses, so perf_test_timeline's scope_breakdown/compare treat V1 and
+# V2 traces identically. (name, owner, attr): owner "self" means the runner
+# instance; otherwise a runner attribute holding the target object.
+_V2_SCOPE_METHODS: list[tuple[str, str, str]] = [
+    ("gpu_model_runner: preprocess", "self", "prepare_inputs"),
+    ("gpu_model_runner: sample", "self", "sample"),
+    ("gpu_model_runner: postprocess", "self", "postprocess_sampled"),
+]
+# forward is inlined in execute_model across three mutually-exclusive branches
+# (FULL cudagraph / PIECEWISE / eager), so there is no single runner forward
+# method. Wrap all three call targets with the same "forward" name; only one
+# fires per step. run_pw_graph internally re-invokes model.forward, so the
+# forward wrap is reentrancy-guarded to avoid a nested double-count.
+_V2_FORWARD_TARGETS: list[tuple[str, str]] = [
+    ("cudagraph_manager", "run_fullgraph"),
+    ("cudagraph_manager", "run_pw_graph"),
+    ("model", "forward"),
+]
+
+
+def _make_scoped(fn, scope_name: str, reentry_guard=None):
+    """Wrap a bound method so its body runs inside record_function(scope_name).
+
+    Args:
+        fn: the original bound method.
+        scope_name: the scope label to emit.
+        reentry_guard: optional (obj, attr) pair. When already inside a
+            same-name scope (attr truthy), the wrapper skips the scope and just
+            calls fn — prevents nested double-count for the piecewise forward
+            path (run_pw_graph -> model.forward).
+    """
+    import vllm.v1.utils as U
+
+    def wrapper(*args, **kwargs):
+        if reentry_guard is not None:
+            obj, attr = reentry_guard
+            if getattr(obj, attr, False):
+                return fn(*args, **kwargs)
+            setattr(obj, attr, True)
+            try:
+                with U.record_function_or_nullcontext(scope_name):
+                    return fn(*args, **kwargs)
+            finally:
+                setattr(obj, attr, False)
+        with U.record_function_or_nullcontext(scope_name):
+            return fn(*args, **kwargs)
+
+    wrapper._scoped = True
+    wrapper._orig = fn
+    return wrapper
+
+
+def _install_scope_patches(worker, wrap_forward: bool = False) -> None:
+    """Install record_function scopes inside a worker process.
+
+    Runs on every rank via ``executor.collective_rpc`` (TP=1 live call, TP>1
+    cloudpickle over spawn/fork). Two effects, both process-local:
+
+    1. Force ``vllm.v1.utils._PROFILER_FUNC = record_function`` so scopes emit
+       regardless of first-call timing (the module global freezes on first
+       call; the driver-side _force_vllm_scopes can't reach worker processes).
+    2. Monkey-patch the V2 runner's granular methods to wrap them in scopes
+       mirroring the V1 names. The V1 runner already has native scopes, so we
+       detect it and only do step 1 (never double-wrap).
+
+    Idempotent. Must be module-level so cloudpickle can resolve it under spawn.
+    """
+    import vllm.v1.utils as U
+    from torch.autograd.profiler import record_function
+
+    U._PROFILER_FUNC = record_function
+
+    mr = getattr(worker, "model_runner", None)
+    if mr is None:
+        return
+
+    # V1 runner already emits gpu_model_runner: scopes natively.
+    if type(mr).__module__ == "vllm.v1.worker.gpu_model_runner":
+        return
+
+    if getattr(mr, "_scopes_installed", False):
+        return
+
+    for scope_name, owner, attr in _V2_SCOPE_METHODS:
+        target = mr if owner == "self" else getattr(mr, owner, None)
+        if target is None:
+            continue
+        fn = getattr(target, attr, None)
+        if fn is None or getattr(fn, "_scoped", False):
+            continue
+        setattr(target, attr, _make_scoped(fn, scope_name))
+
+    # Output dispatch (D2H): mirror V1's "gpu_model_runner: ModelRunnerOutput"
+    # scope. In V2 the output object + async D2H copy is set up in
+    # AsyncOutput.__init__ (inlined in sample_tokens, not a runner method), so
+    # wrap the class initializer — this is the analogue of RTP's dispatch_output.
+    try:
+        from vllm.v1.worker.gpu.async_utils import AsyncOutput
+        if not getattr(AsyncOutput.__init__, "_scoped", False):
+            AsyncOutput.__init__ = _make_scoped(
+                AsyncOutput.__init__, "gpu_model_runner: ModelRunnerOutput"
+            )
+    except Exception:
+        pass
+
+    if wrap_forward:
+        mr._in_forward_scope = False
+        for owner, attr in _V2_FORWARD_TARGETS:
+            target = mr if owner == "self" else getattr(mr, owner, None)
+            if target is None:  # cudagraph_manager is None under enforce_eager
+                continue
+            fn = getattr(target, attr, None)
+            if fn is None or getattr(fn, "_scoped", False):
+                continue
+            setattr(
+                target, attr,
+                _make_scoped(fn, "gpu_model_runner: forward",
+                             reentry_guard=(mr, "_in_forward_scope")),
+            )
+
+    mr._scopes_installed = True
+
+
 @dataclass
 class StepStat:
     forward_ms: float
@@ -95,6 +223,8 @@ class BenchHarness:
         dp_barrier=None,
         disable_mm: bool = False,
         worker_profiler_dir: str | None = None,
+        inject_scopes: bool = False,
+        scope_forward: bool = False,
     ):
         self._dp_barrier = dp_barrier
 
@@ -163,6 +293,15 @@ class BenchHarness:
         self.block_size = self.scheduler.block_size
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(self.block_size, sha256)
+
+        if inject_scopes:
+            # Fan out to every rank (TP=1 UniProc live call; TP>1 cloudpickle).
+            # Forces the profiler-func freeze and adds record_function scopes to
+            # the V2 runner, in-process. Must run after model load (model_runner
+            # exists) and before any profiled steps.
+            self.executor.collective_rpc(
+                _install_scope_patches, args=(scope_forward,)
+            )
 
     def submit(
         self,
@@ -370,6 +509,11 @@ class BenchHarness:
 
     def _debug_print_runner(self) -> None:
         """Print the active model-runner class — V1 (scoped) vs V2 (no scopes)."""
+        if not hasattr(self.executor, "driver_worker"):
+            # MultiprocExecutor (TP>1) runs workers in subprocesses; the driver
+            # has no in-process worker to probe.
+            print("[scope] runner probe skipped (TP>1, no driver_worker)")
+            return
         try:
             mr = self.executor.driver_worker.model_runner
             cls = type(mr)
