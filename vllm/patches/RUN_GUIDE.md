@@ -103,7 +103,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 | 参数 | 说明 |
 |---|---|
 | `--mode {prefill,decode}` | 基准模式 |
-| `--batch-sizes` / `--seq-lens` | 逗号分隔的网格；decode 时 seq-lens 是 kv_len |
+| `--batch-sizes` / `--seq-lens` | 逗号分隔的网格；decode 时 seq-lens 是 kv_len；DP 模式下 batch-sizes 是每 rank 口径（见 §4.2） |
 | `--num-iters` / `--num-warmup-iters` | 每格测量轮数 / 预热轮数（预热不计入） |
 | `--num-decode-steps` | decode 模式每轮的 decode 步数 |
 | `--max-model-len` | 需 ≥ `max(seq_lens) + num_decode_steps`；不必为省显存刻意压小（见下） |
@@ -131,7 +131,9 @@ profiling 要用 `--worker-profile-dir`（见 §6）。
 
 ### 4.2 DP（`--dp-size N`）
 
-runner 启动 N 个进程，每个 rank 分 `batch_size // dp_size` 个请求，两种模式自动选择：
+runner 启动 N 个进程。`--batch-sizes` 是**每 DP rank** 的 batch size（与 RTP-LLM
+GridRunner 同语义，总请求数 = bs × dp_size），每个 rank 直接跑 bs 个请求。
+两种模式自动选择：
 
 - **独立 DP**（Dense 模型，或 MoE 不开 EP）：各 rank 用 `CUDA_VISIBLE_DEVICES` 隔离
   GPU，完全独立运行
@@ -141,11 +143,11 @@ runner 启动 N 个进程，每个 rank 分 `batch_size // dp_size` 个请求，
   双 rank 结果 spread < 1%
 
 ```bash
-# Qwen3-235B-A22B-FP8, TP=4 × DP=2 EP（8×H20）
+# Qwen3-235B-A22B-FP8, TP=4 × DP=2 EP（8×H20）；每 rank 64 请求，全局 128
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   --model /home/models/Qwen3-235B-A22B-Instruct-2507-FP8 \
-  --mode decode --batch-sizes 128 --seq-lens 128 \
+  --mode decode --batch-sizes 64 --seq-lens 128 \
   --num-iters 3 --num-decode-steps 30 --num-warmup-iters 1 \
   --enforce-eager --max-model-len 512 --gpu-memory-utilization 0.9 \
   --tp-size 4 --dp-size 2 --enable-expert-parallel
@@ -153,7 +155,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 
 注意：
 
-- `batch_size` 必须 ≥ `dp_size` 且能整除
+- 与 RTP 对比时 batch_size 可直接对齐（两边都是 per-rank 口径）
 - 表格 / CSV 只输出 rank 0（RTP 是全 rank 平均）；runner 会对 rank 间 >10% 的差异打
   WARNING，任一 rank 失败 / 缺结果 / 退出码非零则整体报错退出
 - 235B FP8 至少 TP=4 才能放进单 DP rank（~60GB/GPU）；TP=2 需开 EP 才装得下
@@ -236,12 +238,14 @@ python3 -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
 
 # vLLM ↔ RTP 逐组件每步 diff。
 # ⚠️ RTP trace 文件名不符合 vllm_* 命名，必须 --steps-b 指定其 decode 步数，
-# 否则回落为 1、RTP 侧 per-step 值被放大真实步数倍（会打 WARNING）
+# 否则回落为 1、RTP 侧 per-step 值被放大真实步数倍（会打 WARNING）。
+# RTP 的 profiling 轮只采 min(decode_test_length, 3) 步（batch_perf_impl.py
+# 的 profile_step），所以 decode trace 通常是 --steps-b 3，prefill 是 1
 python3 -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
-  --compare vllm.json rtp.json --labels vLLM RTP-LLM --steps 10 --steps-b 4
+  --compare vllm.json rtp.json --labels vLLM RTP-LLM --steps 10 --steps-b 3
 
 # 或在跑 vLLM 时直接对比：
-#   runner 加 --rtp-trace rtp.json --rtp-trace-steps 4
+#   runner 加 --rtp-trace rtp.json --rtp-trace-steps 3
 ```
 
 说明：
@@ -310,7 +314,7 @@ timeline 在 bazel testlogs 的 `test.outputs/timelines/` 下；BUILD env 里
 
 ### Qwen3-235B-A22B-FP8, TP=4 × DP=2 EP, 8×H20
 
-| BS (global) | SeqLen | Rank 0 (ms) | Rank 1 (ms) |
+| BS (per rank) | SeqLen | Rank 0 (ms) | Rank 1 (ms) |
 |---|---|---|---|
-| 128 | 128 | 123.75 | 126.19 |
-| 1024 | 128 | 127.74 | 126.45 |
+| 64 | 128 | 123.75 | 126.19 |
+| 512 | 128 | 127.74 | 126.45 |

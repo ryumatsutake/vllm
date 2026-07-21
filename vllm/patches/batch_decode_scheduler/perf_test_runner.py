@@ -8,7 +8,9 @@ Usage::
         --batch-sizes 1,4 \
         --seq-lens 128,256
 
-    # DP=2 decode benchmark (each rank gets batch_size // dp_size requests)
+    # DP=2 decode benchmark. RTP-aligned semantics: --batch-sizes is the
+    # PER-DP-RANK batch size (total requests = batch_size x dp_size),
+    # matching RTP-LLM GridRunner's batch_size column.
     python -m vllm.patches.batch_decode_scheduler.perf_test_runner \
         --model facebook/opt-125m \
         --mode decode \
@@ -266,7 +268,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-sizes", default="1,4,16",
-        help="Comma-separated batch sizes",
+        help="Comma-separated batch sizes. With --dp-size N this is the "
+        "PER-DP-RANK batch size (total = batch_size x dp_size), matching "
+        "RTP-LLM GridRunner semantics.",
     )
     parser.add_argument(
         "--seq-lens", default="128,512,1024",
@@ -288,8 +292,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-size", type=int, default=1,
                         help="Pipeline parallel size")
     parser.add_argument("--dp-size", type=int, default=1,
-                        help="Data parallel size (spawns N processes, "
-                        "each rank gets batch_size // dp_size requests)")
+                        help="Data parallel size (spawns N processes; each "
+                        "rank runs batch_size requests — RTP-aligned "
+                        "per-rank semantics, total = batch_size x N)")
     parser.add_argument(
         "--enable-expert-parallel", action="store_true",
         help="Enable expert parallelism for MoE models (split experts "
@@ -550,7 +555,7 @@ def _dp_worker(
     batch_sizes: list[int],
     seq_lens: list[int],
 ) -> None:
-    """Worker process for one DP rank."""
+    """Worker process for one DP rank (runs batch_sizes as-is, per-rank)."""
     os.setsid()
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     _apply_scope_env(args)
@@ -570,7 +575,7 @@ def _dp_worker(
         gpus = ",".join(str(gpu_start + i) for i in range(tp_size))
         os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
-    local_batch_sizes = [bs // dp_size for bs in batch_sizes]
+    local_batch_sizes = list(batch_sizes)
     try:
         t_start = time.time()
         results = _run_bench_grid(
@@ -578,8 +583,6 @@ def _dp_worker(
             dp_barrier=barrier if use_dp_env else None,
         )
         elapsed = time.time() - t_start
-        for r in results:
-            r.batch_size *= dp_size
         print(f"[DP rank {rank}] "
               f"primary={[f'{r.primary_ms:.2f}' for r in results]} "
               f"({elapsed:.1f}s total incl. init)")
@@ -608,13 +611,6 @@ def main() -> None:
             write_csv(results, args.output)
             print(f"\nCSV written to {args.output}")
         return
-
-    for bs in batch_sizes:
-        if bs < dp_size or bs % dp_size != 0:
-            raise ValueError(
-                f"batch_size {bs} must be >= dp_size ({dp_size}) "
-                f"and divisible by it"
-            )
 
     use_dp_env = args.enable_expert_parallel and _detect_moe(args.model)
     dp_mode = (
@@ -698,8 +694,8 @@ def main() -> None:
                           f"bs={r0.batch_size} seq={r0.seq_len}")
 
     print()
-    print(f"=== DP={dp_size} (showing rank 0 results, "
-          f"batch_size is global) ===")
+    print(f"=== DP={dp_size} (showing rank 0; batch_size is PER-DP-RANK, "
+          f"RTP-aligned — total = bs x {dp_size}) ===")
     print_table(results)
     if args.output:
         write_csv(results, args.output)
