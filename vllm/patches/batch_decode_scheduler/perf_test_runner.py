@@ -1,10 +1,14 @@
 """CLI runner for GPU end-to-end prefill/decode benchmarking.
 
+Mode switch is RTP-LLM-aligned (``--partial``, same values as RTP's
+perf test): 0 = PD (real prefill + decode), 1 = decode only (fake-KV,
+matches RTP grid decode), 2 = prefill only.
+
 Usage::
 
     python -m vllm.patches.batch_decode_scheduler.perf_test_runner \
         --model facebook/opt-125m \
-        --mode prefill \
+        --partial 2 \
         --batch-sizes 1,4 \
         --seq-lens 128,256
 
@@ -13,7 +17,7 @@ Usage::
     # matching RTP-LLM GridRunner's batch_size column.
     python -m vllm.patches.batch_decode_scheduler.perf_test_runner \
         --model facebook/opt-125m \
-        --mode decode \
+        --partial 1 \
         --batch-sizes 4,8 \
         --seq-lens 128 \
         --dp-size 2
@@ -263,8 +267,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", required=True, help="Model name or path")
     parser.add_argument(
-        "--mode", required=True, choices=["prefill", "decode"],
-        help="Benchmark mode",
+        "--partial", type=int, default=1, choices=[0, 1, 2],
+        help="RTP-LLM-aligned mode switch (same values as RTP perf test): "
+        "0 = PD (real prefill + decode in one round, both metrics), "
+        "1 = decode only (fake-KV: KV blocks allocated and registered on "
+        "every rank via collective_rpc but hold zeroed content, prefill "
+        "forward skipped — matches RTP setIsContextStream(false); works "
+        "for TP=1 and TP>1), "
+        "2 = prefill only. Replaces the old --mode/--skip-prefill-forward.",
     )
     parser.add_argument(
         "--batch-sizes", default="1,4,16",
@@ -299,15 +309,6 @@ def parse_args() -> argparse.Namespace:
         "--enable-expert-parallel", action="store_true",
         help="Enable expert parallelism for MoE models (split experts "
         "across DP ranks with all-to-all communication)",
-    )
-    parser.add_argument(
-        "--skip-prefill-forward", action="store_true",
-        help="Skip prefill forward in decode mode: KV blocks are allocated "
-        "and registered on every rank via collective_rpc but hold zeroed "
-        "content (aligns with RTP-LLM setIsContextStream(false)). Works for "
-        "TP=1 and TP>1. Experimental: attention reads all-zero KV, so "
-        "numerics differ from a real prefill — use for kernel-timing "
-        "alignment only, not for accuracy-sensitive comparisons.",
     )
     parser.add_argument(
         "--disable-mm", action="store_true",
@@ -383,6 +384,9 @@ def _run_bench_grid(
     dp_barrier: multiprocessing.Barrier | None = None,
 ) -> list[BenchResult]:
     """Run the full benchmark grid on the current process. Returns results."""
+    # RTP-aligned partial: 2 = prefill only; 1 = fake-KV decode; 0 = PD.
+    mode = "prefill" if args.partial == 2 else "decode"
+    skip_prefill = args.partial == 1
     max_batch_size = max(batch_sizes)
     max_seq_len = max(seq_lens)
     print(f"Initializing harness (model={args.model}, "
@@ -422,11 +426,11 @@ def _run_bench_grid(
         results: list[BenchResult] = []
         for bs in batch_sizes:
             for seq_len in seq_lens:
-                label = f"{args.mode} bs={bs} seq_len={seq_len}"
+                label = f"{mode} bs={bs} seq_len={seq_len}"
                 print(f"Running {label} ...")
 
                 # Timing pass.
-                if args.mode == "prefill":
+                if mode == "prefill":
                     r = run_prefill_bench(
                         harness, bs, seq_len,
                         args.num_iters, args.num_warmup_iters,
@@ -436,21 +440,21 @@ def _run_bench_grid(
                         harness, bs, seq_len,
                         args.num_decode_steps,
                         args.num_iters, args.num_warmup_iters,
-                        skip_prefill_forward=args.skip_prefill_forward,
+                        skip_prefill_forward=skip_prefill,
                         worker_profile=bool(args.worker_profile_dir),
                     )
                 results.append(r)
-                metric = "per_token" if args.mode == "decode" else "prefill"
+                metric = "per_token" if mode == "decode" else "prefill"
                 print(f"  {label}: {metric}={r.primary_ms:.2f}ms "
                       f"cost={r.cost_ms:.2f}ms")
 
                 # Dedicated torch-profile pass for per-component breakdown.
                 if use_torch_profile:
-                    steps = args.num_decode_steps if args.mode == "decode" else 1
+                    steps = args.num_decode_steps if mode == "decode" else 1
                     trace = harness.profile_run(
-                        bs, seq_len, args.mode, steps,
+                        bs, seq_len, mode, steps,
                         profile_output,
-                        skip_prefill_forward=args.skip_prefill_forward,
+                        skip_prefill_forward=skip_prefill,
                     )
                     print(f"  Trace: {trace}")
                     if args.analyze or args.rtp_trace:

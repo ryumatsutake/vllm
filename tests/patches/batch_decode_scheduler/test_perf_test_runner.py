@@ -95,11 +95,10 @@ def _args():
         scope_forward=False,
         profile=False,
         profile_output=None,
-        mode="prefill",
+        partial=2,
         num_iters=1,
         num_warmup_iters=0,
         num_decode_steps=1,
-        skip_prefill_forward=False,
         analyze=False,
         rtp_trace=None,
     )

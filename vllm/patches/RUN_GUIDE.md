@@ -77,19 +77,20 @@ H20 已知问题与 workaround（harness 已内置处理的标注为「自动」
 ```bash
 cd /tmp
 
-# Prefill：测首 token 延迟
+# Prefill：测首 token 延迟（--partial 2）
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   --model /home/models/Qwen3-8B \
-  --mode prefill \
+  --partial 2 \
   --batch-sizes 1,4,16 --seq-lens 128,512,1024 \
   --num-iters 5 --num-warmup-iters 1 \
   --enforce-eager --max-model-len 2048 --dtype bfloat16 \
   --gpu-memory-utilization 0.6
 
-# Decode：测每 token 延迟（真实 prefill 铺 KV 后跑 N 步 decode）
+# Decode：PD 路径（--partial 0，真实 prefill 铺 KV 后跑 N 步 decode，两个指标都出）；
+# 严格对齐 RTP 的 decode-only 用 --partial 1（fake-KV，见 §5）
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   --model /home/models/Qwen3-8B \
-  --mode decode \
+  --partial 0 \
   --batch-sizes 1,4,16 --seq-lens 128,512,1024 \
   --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
   --enforce-eager --max-model-len 2048 --dtype bfloat16 \
@@ -102,7 +103,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 
 | 参数 | 说明 |
 |---|---|
-| `--mode {prefill,decode}` | 基准模式 |
+| `--partial {0,1,2}` | RTP 同语义模式开关：0=PD（真实 prefill+decode），1=只 decode（fake-KV，默认，见 §5），2=只 prefill |
 | `--batch-sizes` / `--seq-lens` | 逗号分隔的网格；decode 时 seq-lens 是 kv_len；DP 模式下 batch-sizes 是每 rank 口径（见 §4.2） |
 | `--num-iters` / `--num-warmup-iters` | 每格测量轮数 / 预热轮数（预热不计入） |
 | `--num-decode-steps` | decode 模式每轮的 decode 步数 |
@@ -111,7 +112,6 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 | `--enforce-eager` | 关 CUDA graph / torch.compile；要看清 kernel 语义名或用 scope 时必开 |
 | `--tp-size` / `--pp-size` / `--dp-size` | 并行配置（见 §4） |
 | `--enable-expert-parallel` | MoE 开 EP（配合 `--dp-size` 见 §4.2） |
-| `--skip-prefill-forward` | fake-KV decode（见 §5） |
 | `--disable-mm` | VL 模型只测语言部分：清零多模态槽位，跳过视觉塔显存 profiling |
 | `--output` | CSV 输出路径 |
 
@@ -147,7 +147,7 @@ GridRunner 同语义，总请求数 = bs × dp_size），每个 rank 直接跑 b
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   --model /home/models/Qwen3-235B-A22B-Instruct-2507-FP8 \
-  --mode decode --batch-sizes 64 --seq-lens 128 \
+  --partial 0 --batch-sizes 64 --seq-lens 128 \
   --num-iters 3 --num-decode-steps 30 --num-warmup-iters 1 \
   --enforce-eager --max-model-len 512 --gpu-memory-utilization 0.9 \
   --tp-size 4 --dp-size 2 --enable-expert-parallel
@@ -160,7 +160,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
   WARNING，任一 rank 失败 / 缺结果 / 退出码非零则整体报错退出
 - 235B FP8 至少 TP=4 才能放进单 DP rank（~60GB/GPU）；TP=2 需开 EP 才装得下
 
-## 5. fake-KV decode（`--skip-prefill-forward`，实验功能）
+## 5. fake-KV decode（`--partial 1`，对齐 RTP，实验功能）
 
 跳过 prefill forward：KV block 照常分配、请求经 `collective_rpc` 注册到**每个 TP rank**
 的 model_runner（并写入伪 token，V1 runner 写 `token_ids_cpu`，V2 写
@@ -169,11 +169,11 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 
 ```bash
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen2.5-0.5B-Instruct --mode decode \
+  --model /home/models/Qwen2.5-0.5B-Instruct --partial 1 \
   --batch-sizes 4 --seq-lens 128 \
   --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
   --enforce-eager --max-model-len 512 --gpu-memory-utilization 0.5 \
-  --tp-size 2 --skip-prefill-forward
+  --tp-size 2
 ```
 
 限制：attention 读全零 KV，数值与真实 prefill 不同——**仅用于 kernel 计时对齐**，不用于
@@ -213,7 +213,7 @@ scope 是 **CPU 墙钟**，用于阶段级语义对照；GPU 归因始终以 ker
 ```bash
 # TP=1：driver 抓 trace + 打印分类表和 scope 表
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3-8B --mode decode \
+  --model /home/models/Qwen3-8B --partial 0 \
   --batch-sizes 4 --seq-lens 128 --num-iters 2 --num-decode-steps 10 \
   --enforce-eager --max-model-len 2048 --gpu-memory-utilization 0.6 \
   --vllm-scopes --scope-forward \
@@ -221,7 +221,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 
 # TP>1：scope 注入到 worker，用 WorkerProfiler 每 rank 各抓一份
 python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
+  --model /home/models/Qwen3.5-35B-A3B --partial 0 --disable-mm \
   --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
   --max-model-len 2048 --gpu-memory-utilization 0.9 \
   --tp-size 2 --vllm-scopes --worker-profile-dir /tmp/wp_trace
