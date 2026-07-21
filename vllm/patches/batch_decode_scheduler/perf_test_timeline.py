@@ -38,6 +38,10 @@ from pathlib import Path
 # RTP-LLM patterns (from chrome-timeline-analysis/analyze_timeline.py) are kept
 # so the categories line up; vLLM-specific kernel families are added alongside.
 _KERNEL_PATTERNS: list[tuple[str, str]] = [
+    # --- MoE communication (EP) ---
+    # MUST precede Attention: its "_fwd_kernel" pattern would otherwise
+    # swallow _fwd_kernel_ep_scatter/_fwd_kernel_ep_gather (first match wins).
+    (r"deep_ep::|_fwd_kernel_ep_scatter|_fwd_kernel_ep_gather", "MoE Communication"),
     # --- Attention (RTP: flashinfer/flash; vLLM: flash_attn, triton, flashinfer) ---
     (r"BatchDecodeWithPagedKVCacheKernel|BatchPrefill|PrefillWithKVCacheKernel"
      r"|flash_fwd|MergeStates|sm90_fp8_mqa_logits|mla_combine"
@@ -54,8 +58,6 @@ _KERNEL_PATTERNS: list[tuple[str, str]] = [
     # --- MoE routing / align ---
     (r"moeSoftmax|moeTopK|fakeBalanceExpert"
      r"|topk_softmax|moe_align|moe_sum|sgl_moe", "MoE Routing"),
-    # --- MoE communication (EP) ---
-    (r"deep_ep::|_fwd_kernel_ep_scatter|_fwd_kernel_ep_gather", "MoE Communication"),
     # --- Dense GEMM (FP8 / low-precision / cutlass / cublas) ---
     (r"deep_gemm::sm90_fp8_gemm|deep_gemm::transpose", "Dense GEMM (FP8)"),
     (r"nvjet_|cublas|splitKreduce|dot_kernel|reduce_1Block|sm80_xmma_gemm"
@@ -170,10 +172,16 @@ def category_breakdown(trace: dict, num_steps: int | None = None) -> dict:
 
     Returns ``{"categories": {cat: {total_us, count, per_step_us, pct}},
     "total_gpu_us", "num_steps"}``. ``per_step_us`` divides by ``num_steps``
-    (from arg or trace context; falls back to 1).
+    (from arg or trace context; falls back to 1 with a loud warning — a
+    silently wrong step count skews every per-step number by that factor).
     """
     if num_steps is None:
-        num_steps = trace.get("context", {}).get("num_steps") or 1
+        num_steps = trace.get("context", {}).get("num_steps")
+        if num_steps is None:
+            print("WARNING: num_steps not given and not parseable from the "
+                  "trace filename; per-step values assume 1 step and may be "
+                  "inflated. Pass --steps/--steps-b explicitly.")
+            num_steps = 1
     gpu_events = trace["kernel"] + trace["gpu_memcpy"] + trace["gpu_memset"]
     total_gpu = sum(e["dur"] for e in gpu_events) or 1.0
 
@@ -256,7 +264,7 @@ def _print_scope_table(sb: dict) -> None:
     )
     for name, s in rows:
         print(
-            f"{name:<16} {s['total_us']:>11.1f} {s['per_step_us']:>13.2f} "
+            f"{name:<32} {s['total_us']:>11.1f} {s['per_step_us']:>13.2f} "
             f"{s['count']:>7}"
         )
 
@@ -316,7 +324,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="vLLM/RTP timeline analyzer")
     parser.add_argument("trace", nargs="?", help="chrome-trace JSON to analyze")
     parser.add_argument("--steps", type=int, default=None,
-                        help="Override num decode steps (else parsed from name)")
+                        help="Override num decode steps (else parsed from "
+                        "name). With --compare, applies to the FIRST trace.")
+    parser.add_argument("--steps-b", type=int, default=None,
+                        help="Num decode steps for the SECOND --compare "
+                        "trace. RTP-LLM traces don't follow the vllm_* "
+                        "naming, so without this they'd fall back to 1 and "
+                        "inflate per-step values by the true step count.")
     parser.add_argument("--compare", nargs=2, metavar=("VLLM", "RTP"),
                         help="Compare two traces per-category per-step")
     parser.add_argument("--labels", nargs=2, default=["vLLM", "RTP-LLM"],
@@ -325,7 +339,8 @@ def main() -> None:
 
     if args.compare:
         compare(args.compare[0], args.compare[1],
-                args.labels[0], args.labels[1])
+                args.labels[0], args.labels[1],
+                steps_a=args.steps, steps_b=args.steps_b)
     elif args.trace:
         analyze_file(args.trace, args.steps)
     else:

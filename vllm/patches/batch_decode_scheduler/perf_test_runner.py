@@ -23,12 +23,15 @@ import argparse
 import csv
 import multiprocessing
 import os
+import queue
+import signal
 import sys
 import time
+import traceback
+from contextlib import suppress
 from dataclasses import dataclass
 
 import numpy as np
-
 
 from vllm.patches.batch_decode_scheduler.perf_test_harness import BenchHarness
 
@@ -100,6 +103,7 @@ def run_prefill_bench(
         stat = harness.run_step()
         harness.assert_phase(stat, "prefill")
         harness.assert_batch(stat, batch_size)
+        harness.assert_prefill_tokens(stat, batch_size, seq_len)
         # Wall time of the single prefill step (≈ RTP first_token_cost_time).
         cost_ms = harness.mark_batch_end()
         if i >= num_warmup_iters:
@@ -149,6 +153,7 @@ def run_decode_bench(
             setup_stat = harness.run_step()
             harness.assert_phase(setup_stat, "prefill")
             harness.assert_batch(setup_stat, batch_size)
+            harness.assert_prefill_tokens(setup_stat, batch_size, kv_len)
             # Wall time to first token (≈ RTP first_token_cost_time), on the
             # same batch-start clock as cost below.
             prefill_ms = harness.mark_lap()
@@ -292,7 +297,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--skip-prefill-forward", action="store_true",
-        help="Skip prefill forward in decode mode (hack KV blocks, align with RTP-LLM)",
+        help="Skip prefill forward in decode mode: KV blocks are allocated "
+        "and registered on every rank via collective_rpc but hold zeroed "
+        "content (aligns with RTP-LLM setIsContextStream(false)). Works for "
+        "TP=1 and TP>1. Experimental: attention reads all-zero KV, so "
+        "numerics differ from a real prefill — use for kernel-timing "
+        "alignment only, not for accuracy-sensitive comparisons.",
     )
     parser.add_argument(
         "--disable-mm", action="store_true",
@@ -352,6 +362,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to an RTP-LLM chrome trace; prints a per-category "
         "per-step vLLM-vs-RTP diff after profiling.",
     )
+    parser.add_argument(
+        "--rtp-trace-steps", type=int, default=None,
+        help="Decode-step count inside --rtp-trace. RTP traces don't follow "
+        "the vllm_* naming, so without this the per-step normalization "
+        "falls back to 1 and inflates RTP per-step values.",
+    )
     return parser.parse_args()
 
 
@@ -384,63 +400,106 @@ def _run_bench_grid(
         inject_scopes=(args.vllm_scopes or args.vllm_scopes_v1),
         scope_forward=args.scope_forward,
     )
-    print(f"Harness ready in {time.time() - t0:.1f}s")
+    try:
+        print(f"Harness ready in {time.time() - t0:.1f}s")
 
-    min_seq = min(seq_lens)
-    print(f"Global warmup (bs=1, seq_len={min_seq}) ...")
-    harness.submit(1, min_seq, max_tokens=2, ignore_eos=True)
-    harness.run_step_no_timing()
-    harness.run_step_no_timing()
-    harness.drain()
-    print("Global warmup done")
+        min_seq = min(seq_lens)
+        print(f"Global warmup (bs=1, seq_len={min_seq}) ...")
+        harness.submit(1, min_seq, max_tokens=2, ignore_eos=True)
+        harness.run_step_no_timing()
+        harness.run_step_no_timing()
+        harness.drain()
+        print("Global warmup done")
 
-    use_torch_profile = args.profile
-    profile_output = args.profile_output or "./profile_output"
+        use_torch_profile = args.profile
+        profile_output = args.profile_output or "./profile_output"
 
-    results: list[BenchResult] = []
-    for bs in batch_sizes:
-        for seq_len in seq_lens:
-            label = f"{args.mode} bs={bs} seq_len={seq_len}"
-            print(f"Running {label} ...")
+        results: list[BenchResult] = []
+        for bs in batch_sizes:
+            for seq_len in seq_lens:
+                label = f"{args.mode} bs={bs} seq_len={seq_len}"
+                print(f"Running {label} ...")
 
-            # Timing pass.
-            if args.mode == "prefill":
-                r = run_prefill_bench(
-                    harness, bs, seq_len,
-                    args.num_iters, args.num_warmup_iters,
-                )
-            else:
-                r = run_decode_bench(
-                    harness, bs, seq_len,
-                    args.num_decode_steps,
-                    args.num_iters, args.num_warmup_iters,
-                    skip_prefill_forward=args.skip_prefill_forward,
-                    worker_profile=bool(args.worker_profile_dir),
-                )
-            results.append(r)
-            metric = "per_token" if args.mode == "decode" else "prefill"
-            print(f"  {label}: {metric}={r.primary_ms:.2f}ms "
-                  f"cost={r.cost_ms:.2f}ms")
-
-            # Dedicated torch-profile pass for per-component breakdown.
-            if use_torch_profile:
-                steps = args.num_decode_steps if args.mode == "decode" else 1
-                trace = harness.profile_run(
-                    bs, seq_len, args.mode, steps,
-                    profile_output,
-                    skip_prefill_forward=args.skip_prefill_forward,
-                )
-                print(f"  Trace: {trace}")
-                if args.analyze or args.rtp_trace:
-                    from vllm.patches.batch_decode_scheduler.perf_test_timeline import (  # noqa: E501
-                        analyze_file, compare,
+                # Timing pass.
+                if args.mode == "prefill":
+                    r = run_prefill_bench(
+                        harness, bs, seq_len,
+                        args.num_iters, args.num_warmup_iters,
                     )
-                    if args.analyze:
-                        analyze_file(trace, steps)
-                    if args.rtp_trace:
-                        compare(trace, args.rtp_trace, "vLLM", "RTP-LLM",
-                                steps_a=steps)
+                else:
+                    r = run_decode_bench(
+                        harness, bs, seq_len,
+                        args.num_decode_steps,
+                        args.num_iters, args.num_warmup_iters,
+                        skip_prefill_forward=args.skip_prefill_forward,
+                        worker_profile=bool(args.worker_profile_dir),
+                    )
+                results.append(r)
+                metric = "per_token" if args.mode == "decode" else "prefill"
+                print(f"  {label}: {metric}={r.primary_ms:.2f}ms "
+                      f"cost={r.cost_ms:.2f}ms")
+
+                # Dedicated torch-profile pass for per-component breakdown.
+                if use_torch_profile:
+                    steps = args.num_decode_steps if args.mode == "decode" else 1
+                    trace = harness.profile_run(
+                        bs, seq_len, args.mode, steps,
+                        profile_output,
+                        skip_prefill_forward=args.skip_prefill_forward,
+                    )
+                    print(f"  Trace: {trace}")
+                    if args.analyze or args.rtp_trace:
+                        from vllm.patches.batch_decode_scheduler.perf_test_timeline import (  # noqa: E501
+                            analyze_file,
+                            compare,
+                        )
+                        if args.analyze:
+                            analyze_file(trace, steps)
+                        if args.rtp_trace:
+                            compare(trace, args.rtp_trace, "vLLM", "RTP-LLM",
+                                    steps_a=steps,
+                                    steps_b=args.rtp_trace_steps)
+    except BaseException:
+        try:
+            harness.shutdown()
+        except BaseException as shutdown_error:
+            print(
+                "ERROR: Harness shutdown also failed while handling a "
+                "benchmark error:",
+                file=sys.stderr,
+            )
+            traceback.print_exception(shutdown_error, chain=False)
+        raise
+
+    harness.shutdown()
     return results
+
+
+def _dp_failure_reasons(
+    dp_size: int,
+    rank_results: dict[int, list[BenchResult]],
+    rank_errors: dict[int, BaseException],
+    exitcodes: dict[int, int | None],
+    forced_cleanup_ranks: set[int],
+) -> list[str]:
+    """Return reasons a DP run must not be reported as successful."""
+    reasons = [
+        f"rank {rank} failed: {type(error).__name__}: {error}"
+        for rank, error in sorted(rank_errors.items())
+    ]
+    reported_ranks = set(rank_results) | set(rank_errors)
+    missing_ranks = set(range(dp_size)) - reported_ranks
+    if missing_ranks:
+        reasons.append(f"missing results from ranks {sorted(missing_ranks)}")
+    for rank, exitcode in sorted(exitcodes.items()):
+        if exitcode != 0:
+            reasons.append(f"rank {rank} process exit code is {exitcode}")
+    if forced_cleanup_ranks:
+        reasons.append(
+            "forced process-group cleanup was required for ranks "
+            f"{sorted(forced_cleanup_ranks)}"
+        )
+    return reasons
 
 
 def _apply_scope_env(args: argparse.Namespace) -> None:
@@ -467,8 +526,11 @@ def _detect_moe(model: str) -> bool:
         for cfg in (config, getattr(config, "text_config", None)):
             if cfg is None:
                 continue
+            # num_local_experts: Mixtral; num_experts: Qwen-MoE;
+            # n_routed_experts: DeepSeek-V2/V3, GLM-4.5 etc.
             num_experts = getattr(cfg, "num_local_experts", 0) or \
-                          getattr(cfg, "num_experts", 0)
+                          getattr(cfg, "num_experts", 0) or \
+                          getattr(cfg, "n_routed_experts", 0)
             if num_experts > 0:
                 return True
         return False
@@ -489,6 +551,7 @@ def _dp_worker(
     seq_lens: list[int],
 ) -> None:
     """Worker process for one DP rank."""
+    os.setsid()
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     _apply_scope_env(args)
 
@@ -523,7 +586,6 @@ def _dp_worker(
         barrier.wait()
         result_queue.put((rank, results))
     except Exception as e:
-        import traceback
         traceback.print_exc()
         barrier.wait()
         result_queue.put((rank, e))
@@ -555,8 +617,12 @@ def main() -> None:
             )
 
     use_dp_env = args.enable_expert_parallel and _detect_moe(args.model)
-    print(f"DP mode: {'EP (VLLM_DP env vars)' if use_dp_env else 'independent (CUDA_VISIBLE_DEVICES)'}, "
-          f"dp_size={dp_size}")
+    dp_mode = (
+        "EP (VLLM_DP env vars)"
+        if use_dp_env
+        else "independent (CUDA_VISIBLE_DEVICES)"
+    )
+    print(f"DP mode: {dp_mode}, dp_size={dp_size}")
 
     from vllm.utils.network_utils import get_open_port
     master_port = get_open_port() if use_dp_env else 0
@@ -573,22 +639,48 @@ def main() -> None:
         p.start()
         procs.append(p)
 
-    for p in procs:
-        p.join(timeout=600)
-        if p.exitcode is None:
-            print(f"Killing worker pid={p.pid} (timeout)")
-            p.kill()
-
     rank_results: dict[int, list[BenchResult]] = {}
-    while not result_queue.empty():
-        rank, data = result_queue.get_nowait()
+    rank_errors: dict[int, BaseException] = {}
+    for _ in range(dp_size):
+        try:
+            rank, data = result_queue.get(timeout=600)
+        except queue.Empty:
+            print("Timed out waiting for DP rank results")
+            break
         if isinstance(data, Exception):
             print(f"DP rank {rank} failed: {data}")
+            rank_errors[rank] = data
             continue
         rank_results[rank] = data
 
-    if 0 not in rank_results:
-        print("ERROR: rank 0 did not return results")
+    forced_cleanup_ranks: set[int] = set()
+    for rank, p in enumerate(procs):
+        p.join(timeout=30)
+        try:
+            os.killpg(p.pid, 0)
+        except ProcessLookupError:
+            continue
+        forced_cleanup_ranks.add(rank)
+        print(f"Cleaning worker process group pgid={p.pid}")
+        with suppress(ProcessLookupError):
+            os.killpg(p.pid, signal.SIGKILL)
+        p.join(timeout=30)
+
+    result_queue.close()
+    result_queue.join_thread()
+
+    exitcodes = {rank: p.exitcode for rank, p in enumerate(procs)}
+    failure_reasons = _dp_failure_reasons(
+        dp_size,
+        rank_results,
+        rank_errors,
+        exitcodes,
+        forced_cleanup_ranks,
+    )
+    if failure_reasons:
+        print("ERROR: DP benchmark did not shut down cleanly:")
+        for reason in failure_reasons:
+            print(f"  - {reason}")
         sys.exit(1)
 
     results = rank_results[0]

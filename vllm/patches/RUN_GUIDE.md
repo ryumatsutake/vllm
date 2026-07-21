@@ -1,70 +1,36 @@
-# 运行指南：vLLM & RTP-LLM 端到端 Bench
+# vLLM Perf Patch 使用指南
 
-## 环境说明
+`vllm/patches/batch_decode_scheduler/` 是一套 GPU 端到端性能基准工具，用于把 vLLM 的
+prefill / decode 延迟与 RTP-LLM `grid_perf_test` 做**同口径对比**。包含三个模块：
 
-### 机器 A：B300 8×L20D (SM 10.3, CUDA 13.x)
+| 模块 | 作用 |
+|---|---|
+| `perf_test_harness.py` | 包装 EngineCore，按 schedule → execute → update 驱动单步执行并计时；提供 fake-KV、scope 注入等能力 |
+| `perf_test_runner.py` | CLI 入口：跑 batch_size × seq_len 网格，聚合输出表格 / CSV；支持 TP / PP / DP / EP |
+| `perf_test_timeline.py` | Chrome trace 分析器：按组件（Attention / MoE / GEMM / …）归类 GPU kernel 耗时，可与 RTP trace 逐组件对比 |
 
-两个引擎共享同一台机器，共用 `/opt/conda310` Python 环境。
+**计时口径**（与 RTP-LLM 对齐，全文适用）：
 
-- **vLLM**：`pip install -e .` 安装，直接用系统 Python
-- **RTP-LLM**：必须通过 `bazel test` 运行，bazel sandbox 自带依赖隔离，不受系统 pip 影响
-
-**不要**用 `bazel run` 或手动 `python batch_decode_test.py` 跑 RTP-LLM，会加载系统环境里被 vLLM 改过的包导致失败。
-
-### 机器 B：H20 (SM 9.0, CUDA 12.9)
-
-Docker 镜像 `rtp_llm_dev_gpu_cuda12_9`，Python 在 `/opt/conda310/bin/python3`，torch 2.8.0+cu129 预装。
-
-vLLM 安装步骤：
-```bash
-# 安装构建依赖
-/opt/conda310/bin/pip install "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" ninja packaging jinja2
-
-# 安装 vLLM（editable mode，用镜像自带的 torch）
-VLLM_USE_PRECOMPILED=1 /opt/conda310/bin/pip install -e . --no-build-isolation
-```
-
-H20 上的已知问题及 workaround：
-- **FlashInfer GDN prefill JIT 编译失败**：镜像内 GCC 4.8.5 太旧，nvcc 编译 sm_90a CUDA 代码时 segfault。Workaround：在 harness 中设置 `additional_config={"gdn_prefill_backend": "triton"}`
-- **minimax_m3 triton kernel 不兼容**：vLLM 拉入 triton 3.6.0 与 minimax_m3 代码不兼容。Workaround：`kernel_warmup.py` 中 minimax import 加 try/except
-- **nvcc 不在 PATH**：EngineCore 子进程找不到 nvcc 导致 FlashInfer DeepGEMM cubin 编译失败。Workaround：`export PATH=/usr/local/cuda-12.9/bin:$PATH`
-- **engine_core 属性变更**：V1 多进程模式下 `SyncMPClient` 没有 `engine_core` 属性。Workaround：`VLLM_ENABLE_V1_MULTIPROCESSING=0` 使用 InprocClient
+- 所有延迟为 **trimmed mean**：按轮排序、丢掉最小和最大、其余取平均（≥3 轮时），
+  对齐 RTP `batch_perf_impl.run` 的 `measurements[1:-1]`，不是 p50
+- decode 的 `per_token = (cost − prefill) / num_decode_steps`，对齐 RTP `decode_time_per_token`
+- prefill 网格里 `seq_len` 是输入长度；decode 网格里 `seq_len` 是 KV 长度（kv_len）
+- 每步带相位断言：batch 被拆分 / prefill 被截断会**直接报错**而非产出错误数据
 
 ---
 
-## vLLM Bench
+## 1. 环境准备
 
-### B300 (CUDA 13.x)
+### 机器 A：B300 8×L20D（SM 10.3, CUDA 13.x）
 
-```bash
-cd /tmp   # 不能在 /data2/liusongyue.lsy/ 或 vllm/ 下运行（sys.path 冲突）
+vLLM 与 RTP-LLM 共享 `/opt/conda310` Python 环境。
 
-export PATH=/opt/conda310/bin:$PATH
-export CUDA_VISIBLE_DEVICES=0
-export VLLM_ENABLE_V1_MULTIPROCESSING=0   # 走 InprocClient，直接访问 EngineCore
+- vLLM：`pip install -e .`，直接用系统 Python
+- RTP-LLM：必须 `bazel test` 运行（sandbox 隔离依赖）。**不要**用 `bazel run` 或手动
+  `python batch_decode_test.py`，会加载被 vLLM 改过的系统包导致失败
 
-# Prefill
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /mnt/nas1/hf/Qwen3-8B \
-  --mode prefill \
-  --batch-sizes 1,4,16 \
-  --seq-lens 128,512,1024 \
-  --num-iters 5 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 2048 --dtype bfloat16 \
-  --gpu-memory-utilization 0.1
+编译 / 运行需要的环境变量：
 
-# Decode
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /mnt/nas1/hf/Qwen3-8B \
-  --mode decode \
-  --batch-sizes 1,4,16 \
-  --seq-lens 128,512,1024 \
-  --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 2048 --dtype bfloat16 \
-  --gpu-memory-utilization 0.1
-```
-
-需要的环境变量（编译时也需要，运行时可选）：
 ```bash
 export CC=/data2/liusongyue.lsy/local/gcc12/bin/x86_64-conda-linux-gnu-gcc
 export CXX=/data2/liusongyue.lsy/local/gcc12/bin/x86_64-conda-linux-gnu-g++
@@ -74,34 +40,222 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
-### H20 (CUDA 12.9)
+### 机器 B：H20（SM 9.0, CUDA 12.9）
+
+Docker 镜像 `rtp_llm_dev_gpu_cuda12_9`，Python 在 `/opt/conda310/bin/python3`，
+torch 2.8.0+cu129 预装。本地模型在 `/home/models/` 下。
 
 ```bash
-export PATH=/usr/local/cuda-12.9/bin:/opt/conda310/bin:$PATH
-export CUDA_VISIBLE_DEVICES=1              # GPU 0 可能被其他任务占用
-export VLLM_ENABLE_V1_MULTIPROCESSING=0    # 走 InprocClient，直接访问 EngineCore
+# 安装
+/opt/conda310/bin/pip install "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
+  "setuptools-rust>=1.9.0" ninja packaging jinja2
+VLLM_USE_PRECOMPILED=1 /opt/conda310/bin/pip install -e . --no-build-isolation
 
-# Decode (Qwen3.5-35B-A3B-FP8, MoE 模型)
-/opt/conda310/bin/python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3.5-35B-A3B-FP8/ \
+# 每次运行前
+export PATH=/usr/local/cuda-12.9/bin:/opt/conda310/bin:$PATH
+```
+
+H20 已知问题与 workaround（harness 已内置处理的标注为「自动」）：
+
+| 问题 | 处理 |
+|---|---|
+| FlashInfer GDN prefill JIT 失败（GCC 4.8.5 太旧） | 自动：harness 设 `additional_config={"gdn_prefill_backend": "triton"}` |
+| `SyncMPClient` 无 `engine_core` 属性 | 自动：runner 设 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 走 InprocClient |
+| EngineCore 子进程找不到 nvcc | 手动：`export PATH=/usr/local/cuda-12.9/bin:$PATH` |
+| minimax_m3 triton kernel 不兼容 | 已在 `kernel_warmup.py` 加 try/except |
+
+### 通用注意
+
+- 在 `/tmp` 等目录下运行，**不要**在 vllm 源码目录下运行（sys.path 冲突）
+- 模型必须传本地有效路径（如 `/home/models/Qwen3-8B`）；路径不存在时 transformers
+  会把它当 HF repo id 报 `HFValidationError`
+
+---
+
+## 2. 快速开始
+
+```bash
+cd /tmp
+
+# Prefill：测首 token 延迟
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3-8B \
+  --mode prefill \
+  --batch-sizes 1,4,16 --seq-lens 128,512,1024 \
+  --num-iters 5 --num-warmup-iters 1 \
+  --enforce-eager --max-model-len 2048 --dtype bfloat16 \
+  --gpu-memory-utilization 0.6
+
+# Decode：测每 token 延迟（真实 prefill 铺 KV 后跑 N 步 decode）
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3-8B \
   --mode decode \
-  --batch-sizes 1,4,16 \
-  --seq-lens 128,512,1024 \
-  --num-iters 5 --num-decode-steps 20 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 8192 \
-  --gpu-memory-utilization 0.85 \
-  --tp-size 1
+  --batch-sizes 1,4,16 --seq-lens 128,512,1024 \
+  --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
+  --enforce-eager --max-model-len 2048 --dtype bfloat16 \
+  --gpu-memory-utilization 0.6
+```
+
+输出为表格；加 `--output result.csv` 同时写 CSV。
+
+## 3. 常用参数
+
+| 参数 | 说明 |
+|---|---|
+| `--mode {prefill,decode}` | 基准模式 |
+| `--batch-sizes` / `--seq-lens` | 逗号分隔的网格；decode 时 seq-lens 是 kv_len |
+| `--num-iters` / `--num-warmup-iters` | 每格测量轮数 / 预热轮数（预热不计入） |
+| `--num-decode-steps` | decode 模式每轮的 decode 步数 |
+| `--max-model-len` | 需 ≥ `max(seq_lens) + num_decode_steps`；不必为省显存刻意压小（见下） |
+| `--gpu-memory-utilization` | KV + 激活显存上限比例 |
+| `--enforce-eager` | 关 CUDA graph / torch.compile；要看清 kernel 语义名或用 scope 时必开 |
+| `--tp-size` / `--pp-size` / `--dp-size` | 并行配置（见 §4） |
+| `--enable-expert-parallel` | MoE 开 EP（配合 `--dp-size` 见 §4.2） |
+| `--skip-prefill-forward` | fake-KV decode（见 §5） |
+| `--disable-mm` | VL 模型只测语言部分：清零多模态槽位，跳过视觉塔显存 profiling |
+| `--output` | CSV 输出路径 |
+
+**显存要点**：token 预算 `max_num_batched_tokens = max(max_bs × max(seq_lens), max_model_len)`。
+profile 阶段的激活峰值由它决定，所以真正撑爆显存的是 `bs × max(seq_lens)`，大 batch +
+长 seq 时减 batch 或 seq，而不是压 `max_model_len`。
+
+---
+
+## 4. 并行模式
+
+### 4.1 TP / PP
+
+`--tp-size N` 即可；TP>1 时 vLLM 用 MultiprocExecutor（worker 在子进程），harness 的
+fake-KV、scope 注入均通过 `collective_rpc` 广播到每个 rank，功能不受影响。唯一区别是
+profiling 要用 `--worker-profile-dir`（见 §6）。
+
+### 4.2 DP（`--dp-size N`）
+
+runner 启动 N 个进程，每个 rank 分 `batch_size // dp_size` 个请求，两种模式自动选择：
+
+- **独立 DP**（Dense 模型，或 MoE 不开 EP）：各 rank 用 `CUDA_VISIBLE_DEVICES` 隔离
+  GPU，完全独立运行
+- **跨 DP EP**（MoE + `--enable-expert-parallel`）：通过 `VLLM_DP_RANK/SIZE/MASTER_*`
+  环境变量组成共享 world，experts 按 EP=TP×DP 切分、all-to-all 跨 rank 通信；engine
+  init 各阶段有 barrier 同步。已实测 Qwen3-235B TP4/DP2、122B TP2/DP2 与 TP4/DP2，
+  双 rank 结果 spread < 1%
+
+```bash
+# Qwen3-235B-A22B-FP8, TP=4 × DP=2 EP（8×H20）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3-235B-A22B-Instruct-2507-FP8 \
+  --mode decode --batch-sizes 128 --seq-lens 128 \
+  --num-iters 3 --num-decode-steps 30 --num-warmup-iters 1 \
+  --enforce-eager --max-model-len 512 --gpu-memory-utilization 0.9 \
+  --tp-size 4 --dp-size 2 --enable-expert-parallel
+```
+
+注意：
+
+- `batch_size` 必须 ≥ `dp_size` 且能整除
+- 表格 / CSV 只输出 rank 0（RTP 是全 rank 平均）；runner 会对 rank 间 >10% 的差异打
+  WARNING，任一 rank 失败 / 缺结果 / 退出码非零则整体报错退出
+- 235B FP8 至少 TP=4 才能放进单 DP rank（~60GB/GPU）；TP=2 需开 EP 才装得下
+
+## 5. fake-KV decode（`--skip-prefill-forward`，实验功能）
+
+跳过 prefill forward：KV block 照常分配、请求经 `collective_rpc` 注册到**每个 TP rank**
+的 model_runner（并写入伪 token，V1 runner 写 `token_ids_cpu`，V2 写
+`last_sampled_tokens`），但 KV 内容为全零，对齐 RTP `setIsContextStream(false)`。
+**TP=1 和 TP>1 均可用**，适用于真实 prefill 会 OOM 或太慢的大 BS × 长 kv_len 场景。
+
+```bash
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen2.5-0.5B-Instruct --mode decode \
+  --batch-sizes 4 --seq-lens 128 \
+  --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
+  --enforce-eager --max-model-len 512 --gpu-memory-utilization 0.5 \
+  --tp-size 2 --skip-prefill-forward
+```
+
+限制：attention 读全零 KV，数值与真实 prefill 不同——**仅用于 kernel 计时对齐**，不用于
+精度相关对比。（已用 Qwen2.5-0.5B 在 TP=1/TP=2 验证，per_token 与真实 prefill 同量级。）
+
+---
+
+## 6. Profiling
+
+三种抓 timeline 的方式：
+
+| 方式 | 开关 | 适用 | 说明 |
+|---|---|---|---|
+| A. torch.profiler | `--profile [--profile-output DIR]` | TP=1 | driver 进程内自采集，专用 profiling pass（prefill 在窗口外，trace 恰好 N 步 decode），输出 `vllm_<mode>_bs<B>_seq<S>_steps<N>.json` |
+| B. WorkerProfiler | `--worker-profile-dir DIR` | **TP>1 / DP / EP 唯一可用** | 经 `collective_rpc` 每个 rank 各 dump 一份；采集窗口是第一个测量轮的 decode 循环 |
+| C. timeline 分析器 | `--analyze` / 独立运行 | — | 把 A/B 的 chrome trace 按组件分类、与 RTP 对比（见 §7） |
+
+方式 B 注意：输出是 **gzip**、文件名带 rank 后缀，喂分析器前先转换：
+`zcat xxx.pt.trace.json.gz > vllm_decode_bs4_seq128_steps30.json`（或用 `--steps` 指定步数）。
+单份 trace 较大（30 步 235B ≈ 100MB/rank）。
+
+### 引擎阶段 scope（可选，配合 A/B）
+
+- `--vllm-scopes`：在 trace 里输出 `gpu_model_runner: preprocess / sample /
+  postprocess / ModelRunnerOutput` 等 `user_annotation`，与 RTP 的
+  `executor.model_forward / sampler_forward / gather_model_input / dispatch_output`
+  对位。V2 runner 原生无 scope，harness 经 `collective_rpc` 注入到每个 worker
+  （保持真实 V2 路径，TP>1 每 rank 都有）
+- `--scope-forward`：额外套 `gpu_model_runner: forward`。CUDA graph 下只量到 host
+  启动时间，要有意义的 forward 墙钟配 `--enforce-eager`
+- `--vllm-scopes-v1`：逃生开关，强制回退 legacy V1 runner 用其原生 scope
+
+scope 是 **CPU 墙钟**，用于阶段级语义对照；GPU 归因始终以 kernel 分类表为准
+（kernel 分类穿透 CUDA graph，是跨引擎对比唯一可靠的层）。V1/V2 的
+`preprocess/sample/postprocess` 名字对齐但 span 不同，绝对值不可直接比。
+
+```bash
+# TP=1：driver 抓 trace + 打印分类表和 scope 表
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3-8B --mode decode \
+  --batch-sizes 4 --seq-lens 128 --num-iters 2 --num-decode-steps 10 \
+  --enforce-eager --max-model-len 2048 --gpu-memory-utilization 0.6 \
+  --vllm-scopes --scope-forward \
+  --profile --profile-output /tmp/traces --analyze
+
+# TP>1：scope 注入到 worker，用 WorkerProfiler 每 rank 各抓一份
+python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
+  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
+  --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
+  --max-model-len 2048 --gpu-memory-utilization 0.9 \
+  --tp-size 2 --vllm-scopes --worker-profile-dir /tmp/wp_trace
 ```
 
 ---
 
-## RTP-LLM Bench
+## 7. Timeline 分析与 RTP 对比
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
+# 单个 trace 分类分解（steps 从 vllm_* 文件名自动解析，可 --steps 覆盖）
+python3 -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
+  /tmp/traces/vllm_decode_bs4_seq128_steps10.json
 
+# vLLM ↔ RTP 逐组件每步 diff。
+# ⚠️ RTP trace 文件名不符合 vllm_* 命名，必须 --steps-b 指定其 decode 步数，
+# 否则回落为 1、RTP 侧 per-step 值被放大真实步数倍（会打 WARNING）
+python3 -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
+  --compare vllm.json rtp.json --labels vLLM RTP-LLM --steps 10 --steps-b 4
+
+# 或在跑 vLLM 时直接对比：
+#   runner 加 --rtp-trace rtp.json --rtp-trace-steps 4
+```
+
+说明：
+
+- 分类法与 RTP `analyze_timeline.py` 对齐（Attention / MLA / MoE GEMM / MoE Routing /
+  MoE Communication / Dense GEMM / Norm / RoPE / Sampling / Communication / …）
+- CUDA graph + torch.compile 会把 RoPE/Norm/残差融进匿名 `triton_*_fused` kernel
+  （归入 **Fused (compile)** 桶）；要看清各组件用 `--enforce-eager`
+- `Other` 占比 >5% 会提示补充分类模式
+
+### RTP-LLM 侧的跑法
+
+```bash
 BAZEL=/home/liusongyue.lsy/.cache/bazelisk/downloads/sha256/79e4f370efa6e31717b486af5d9efd95864d0ef13da138582224ac9b2a1bad86/bin/bazel
-
 cd /data2/liusongyue.lsy/RTP-LLM/github-opensource
 
 $BAZEL --output_user_root=~/.cache/bazel_cuda13_cache \
@@ -112,352 +266,51 @@ $BAZEL --output_user_root=~/.cache/bazel_cuda13_cache \
   --test_timeout=3600 --test_output=all
 ```
 
-测试参数在 `rtp_llm/test/perf_test/BUILD` 的 `grid_perf_test` target 里改：
-```python
-args = [
-    "--model_type", "qwen_3",           # qwen_3 / qwen_3_moe / deepseek_v32
-    "--checkpoint_path", "/mnt/nas1/hf/Qwen3-8B",
-    "--batch_size", "1",
-    "--input_len", "128",
-    "--partial", "0",                    # 0=both, 1=decode, 2=prefill
-    "--decode_test_length", "8",
-    "--seq_size_per_block", "64",        # 必须 64
-    "--tp_size", "1",
-    "--dp_size", "1",
-]
-```
-
-Timeline 输出在 bazel testlogs 的 `test.outputs/timelines/` 下。
+参数在 `rtp_llm/test/perf_test/BUILD` 的 `grid_perf_test` target 里改
+（`--model_type / --checkpoint_path / --batch_size / --input_len / --partial /
+--decode_test_length / --tp_size / --dp_size`；`--seq_size_per_block` 必须 64）。
+timeline 在 bazel testlogs 的 `test.outputs/timelines/` 下；BUILD env 里
+`GEN_TIMELINE_SYNC=1` / `PERF_PREARM_PROFILE=1` / `PERF_PROFILE_NUM_STEPS=N`
+控制采集。
 
 ---
 
-## GPU Profiling（torch.profiler / WorkerProfiler）
+## 8. 已知限制
 
-三种抓 timeline 的方式，按场景选：
-- **方式 A — torch.profiler**：进程内自采集，零引擎配置、依赖最稳定（只用 `torch.profiler`）。
-  TP=1 本地快速分析首选。
-- **方式 B — WorkerProfiler**：vLLM 自带，经 `collective_rpc` 分发到每个 rank，各自出 trace。
-  **TP>1 / DP / EP 场景唯一可用**。
-- **方式 C — perf_test_timeline**：分析器，把 A/B 产出的 chrome trace 按组件分类、与 RTP 对比。
-
-> 注：旧的 nsys（`--profile-mode nsys` + `cudaProfilerStart`）后端已删除——它和 WorkerProfiler
-> 的 cuda 后端底层相同（`cudaProfilerStart/Stop`），后者是超集（多 rank + NVTX）。要 nsys
-> 系统级 timeline，直接用 `nsys profile --capture-range=none` 全程采集即可。
-
-### 方式 A：torch.profiler（轻量，TP=1）
-
-进程内自采集，无需外部 wrapper，零引擎配置，直接生成 Chrome Trace JSON（和 RTP-LLM
-`gen_timeline` 格式兼容）：
-
-```bash
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /mnt/nas1/hf/Qwen3-8B \
-  --mode decode \
-  --batch-sizes 1 --seq-lens 128 \
-  --num-iters 3 --num-decode-steps 10 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 2048 --dtype bfloat16 \
-  --gpu-memory-utilization 0.1 \
-  --profile --profile-output /tmp/traces
-```
-
-输出 `/tmp/traces/vllm_decode_bs1_seq128_steps10.json`，用 `chrome://tracing` 或 Perfetto 查看。
-trace 名里编码了 `mode/bs/seq/steps`，`perf_test_timeline` 据此还原每步平均耗时。
-
-**限制**：单进程,只能抓 driver 进程的前向。**TP>1 时前向在 worker 子进程,抓不到**——用方式 B。
-
-### 方式 B：WorkerProfiler（多 rank / TP>1 / DP+EP）
-
-vLLM 自带的 profiler，经 `collective_rpc` 分发到**每个 TP/DP rank**，各自 dump 一份 trace。
-**TP>1 / DP / EP 场景唯一可用**（方式 A 的单进程 torch.profiler 看不到 worker 子进程）。
-`--worker-profile-dir` 触发：harness 在第一个被测轮的 decode 循环前后调
-`llm.start_profile()` / `stop_profile()`，采集窗口正好是 `num-decode-steps` 步。
-
-底层就是 `ProfilerConfig(profiler="torch")` + `LLM.start_profile/stop_profile`，和方式 A 同一个
-`torch.profiler` 内核，只是多了 per-rank fanout 和每步 NVTX 标注（trace 里的 `execute_context_N`）。
-
-```bash
-# Qwen3-235B-A22B-FP8, TP=2 DP=2 EP, decode 30 步 (H20 × 4)
-export PATH=/usr/local/cuda-12.9/bin:/opt/conda310/bin:$PATH
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-/opt/conda310/bin/python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/muxue.xy/Qwen3-235B-A22B-Instruct-2507-FP8/ \
-  --mode decode --batch-sizes 4 --seq-lens 128 \
-  --num-iters 2 --num-decode-steps 30 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 512 --dtype auto \
-  --gpu-memory-utilization 0.9 \
-  --tp-size 2 --dp-size 2 --enable-expert-parallel \
-  --worker-profile-dir /tmp/wp_trace
-```
-
-产出每 rank 一份：`/tmp/wp_trace/dp{0,1}_tp{0,1}_ep{0..3}_rank*.pt.trace.json.gz`
-（外加每 rank 一份 `profiler_out_N.txt` 的 CUDA-time kernel 表）。
-
-**坑点**：
-- 输出是 **gzip** 且文件名是 rank 后缀（不是方式 A 的 `vllm_..._steps{N}.json` 约定）。
-  要喂 `perf_test_timeline` 得先转：
-  `zcat xxx.pt.trace.json.gz > vllm_decode_bs4_seq128_steps30.json`，
-  再 `perf_test_timeline vllm_decode_bs4_seq128_steps30.json --steps 30`。
-- 单份 trace 很大（30 步 235B ≈ 100MB/rank）。
-- TP=2 不开 EP 会 OOM（235GB / 2 > 单卡 97GB）；开 `--enable-expert-parallel` 把 experts 按
-  EP=TP×DP 切开才装得下（实测每卡 ~61GB）。
-- 需在构造引擎时就带 `profiler_config`（harness 靠 `--worker-profile-dir` 自动完成；直接调
-  `worker.profile()` 而没配 `profiler_config` 会抛 `RuntimeError`）。
-
-### 方式 C：逐组件耗时分解 & 与 RTP 对齐（perf_test_timeline）
-
-`--profile` 会走一次**专用 profiling pass**（warmup → 只抓 decode
-步，prefill 在窗口外），产出干净的 chrome trace。加 `--analyze` 直接打印**按组件分类的
-GPU 耗时**（Attention / MoE GEMM / Dense GEMM / Norm / RoPE / Activation / Sampling /
-Comm …，分类法与 RTP `analyze_timeline.py` 对齐）。
-
-```bash
-# CUDA graph 下的逐组件 GPU 耗时（分类靠 kernel 名，CUDA graph 也准）
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3-8B/ --mode decode \
-  --batch-sizes 4 --seq-lens 128 --num-iters 3 --num-decode-steps 10 \
-  --max-model-len 4096 --dtype bfloat16 --gpu-memory-utilization 0.6 \
-  --profile --profile-output /tmp/traces --analyze
-```
-
-**VL 模型（如 Qwen3.5-35B-A3B-FP8）需加 `--disable-mm`**：把多模态槽位清零,让引擎跳过
-视觉塔的显存 profiling,只跑语言模型 decode（和 RTP 的 text 基准对齐）。否则会在 vision
-dummy batch 处崩。
-
-**vLLM 引擎阶段 scope（对齐 RTP 的 executor.model_forward / sampler_forward）**：加
-`--vllm-scopes`。它在 torch trace 里输出 `gpu_model_runner: forward / preprocess /
-sample / postprocess / ModelRunnerOutput` 和 `schedule: ...` 这些 `user_annotation`，
-`--analyze` 的 "Semantic scopes" 表会列出来。
-
-**V2 runner 现在也有 scope（harness 注入，不再强制回退 V1）**：`gpu_model_runner:` 这些
-scope 原生**只存在于 legacy V1 runner**（`vllm/v1/worker/gpu_model_runner.py`）；新的
-**V2 runner**（`vllm/v1/worker/gpu/model_runner.py`，对 `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`
-里的 Qwen3/Llama/Mistral/DeepseekV2/Qwen2Moe 默认）**原生没有任何 record_function scope**。
-`--vllm-scopes` 现在经 `collective_rpc` 把注入代码发到**每个 worker 进程**，monkey-patch V2
-runner 的 `prepare_inputs`/`sample`/`postprocess_sampled` 和 `AsyncOutput.__init__`，套上与
-V1 同名的 scope。因此**保持真实 V2 部署路径**，且 **TP>1 每个 rank 都能记录**（配
-`--worker-profile-dir`）。天然走 V1 的模型（arch 不在 V2 列表）用其原生 scope——注入会自动
-检测 V1，只破除 profiler-func 冻结、不重复套。
-
-实测（Qwen3.5-35B-A3B, decode 30 步）：V2 注入的 `forward` 与 V1 原生 `forward` 逐值对齐
-（~2.5%），`schedule:` 组一致，`ModelRunnerOutput`（包 `AsyncOutput` 的 D2H）≈ V1 的
-`AsyncGPUModelRunnerOutput`；`preprocess/sample/postprocess` 因 V1/V2 阶段切分不同、注入只
-包内层单个方法（span 更窄/不同）→ **名对齐、可配对，但绝对值不可直接比**（引擎结构差异，非 bug）。
-
-相关开关：
-- `--vllm-scopes`：默认路径，注入 V2（或在天然 V1 的模型上直接用原生 scope）。
-- `--scope-forward`（默认关）：额外套 `gpu_model_runner: forward`。**CUDA graph 下 forward
-  scope 只量到 host 端启动 graph 的时间**（不是 GPU kernel 时间），要有意义的 forward 墙钟配
-  `--enforce-eager`；GPU 归因始终看 kernel 分类表。
-- `--vllm-scopes-v1`（逃生开关）：强制 `VLLM_USE_V2_MODEL_RUNNER=0` 回到 legacy V1 原生
-  scope（含 V1 独有的 `bookkeep`/`eplb`/`AsyncGPUModelRunnerOutput` 等）。注意 V1 是 legacy
-  执行路径，时延不代表 V2 部署。
-
-scope 时长是 CPU 墙钟；CUDA graph replay 下 `forward` 降级为启动时间（GPU 归因看 kernel 分类表）。
-
-```bash
-# V2 runner + 注入 scope（TP=1，driver 进程 torch.profiler 直接抓 + --analyze 打印 scope 表）
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
-  --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
-  --max-model-len 2048 --gpu-memory-utilization 0.9 \
-  --tp-size 1 --vllm-scopes --scope-forward \
-  --profile --profile-output /tmp/traces --analyze
-
-# TP>1：scope 在 worker 子进程，用 --worker-profile-dir 经 collective_rpc 每 rank 各抓一份
-python -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/models/Qwen3.5-35B-A3B --mode decode --disable-mm \
-  --batch-sizes 1 --seq-lens 128 --num-iters 2 --num-decode-steps 30 \
-  --max-model-len 2048 --gpu-memory-utilization 0.9 \
-  --tp-size 2 --vllm-scopes --scope-forward \
-  --worker-profile-dir /tmp/wp_trace
-```
-（TP=1 用 `--profile`（driver torch.profiler）即可；TP>1 前向在 worker 子进程，driver
-profiler 抓不到，必须用 `--worker-profile-dir`——注入代码已在每个 worker 进程里把 scope
-装好，各 rank 的 trace 里都有。gzip trace 喂 `perf_test_timeline` 的转换见方式 B 坑点。）
-
-**单独分析 / 两引擎对比**（analyzer 可独立跑）：
-
-```bash
-# 单个 trace 的分类分解
-python -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
-  /tmp/traces/vllm_decode_bs4_seq128_steps10.json
-
-# vLLM ↔ RTP 逐组件每步 diff（RTP trace 见下方 RTP Profiling 对照）
-python -m vllm.patches.batch_decode_scheduler.perf_test_timeline \
-  --compare vllm.json rtp.json --labels vLLM RTP-LLM
-# 或在跑 vLLM 时直接对比：给 runner 加 --rtp-trace rtp.json
-```
-
-说明：CUDA graph + torch.compile 会把 RoPE/Norm/残差融进匿名 `triton_*_fused` kernel，
-归到 **Fused (compile)** 桶；要看清 RoPE/Norm/Activation 用 `--enforce-eager`（禁融合，
-kernel 名恢复语义）。
-
-### Scope 三层观测能力（重要参考）
-
-推理性能观测分三层，从粗到细、从 CPU 到 GPU。**层一按引擎手埋；层二 / 层三是
-PyTorch / CUDA 自动，RTP 与 vLLM 机制一样。**
-
-#### 层一：引擎阶段 scope（手埋）
-
-- vLLM 用 `record_function_or_nullcontext("...")` 埋，由 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1`
-  开；`--vllm-scopes` 会自动设它，并向 V2 runner 注入同名 scope（见下）。
-- 覆盖：`gpu_model_runner: forward/preprocess/postprocess/sample/bookkeep/eplb/draft/...`、
-  `schedule: allocate_slots/...`、`llm_engine step: ...`、`ngram_proposer_gpu: kernel`。
-- 性质：**CPU 墙钟、引擎阶段级**（forward 是一整块，不下沉到 attn/moe/gemm）。
-- 与 RTP 对齐（引擎阶段级）：
-
-  | 阶段 | vLLM V1 | RTP-LLM |
-  |---|---|---|
-  | 前向 | `gpu_model_runner: forward` | `executor.model_forward`(=py_model.forward) |
-  | 采样 | `gpu_model_runner: sample` | `executor.sampler_forward` |
-  | 输入准备 | `gpu_model_runner: preprocess` | `executor.gather_model_input` |
-  | 输出 | `postprocess`/`ModelRunnerOutput` | `executor.dispatch_output` |
-  | 调度 | `schedule: allocate_slots` | 埋在 `engine.normal.step` 外层（包住 `scheduler_->schedule()`，`CanRun`→RUNNING 后返回，forward 在 `process()` 里）|
-
-  V2 runner 经 harness 注入后 emit 同名 scope（`preprocess`/`sample`/`postprocess`/
-  `ModelRunnerOutput`/`forward`），所以上表对 V2 也成立（`forward`/`schedule` 逐值对齐 V1；
-  `preprocess/sample/postprocess` 名对齐、值因 span 不同而异，见方式 C）。
-
-- **失效 / 降级条件**（V2 与 TP>1 已被 harness 注入解决，见方式 C）：
-  - **V2 runner 原生无 scope** → 已解决：`--vllm-scopes` 经 `collective_rpc` 向每个 worker
-    注入，mirror V1 名，**保持真实 V2 路径**（不再强制回退 V1）。`--vllm-scopes-v1` 可回退
-    legacy V1 原生 scope。
-  - **TP>1** → 已解决：注入在每个 worker 进程内执行，配 `--worker-profile-dir` 每 rank 各抓
-    一份 trace（driver 进程 torch.profiler 仍抓不到 worker，故 TP>1 必须用 worker-profile-dir）。
-  - **CUDA graph**：`forward` scope 仍触发，但只量到"启动 graph"的 host 时间（实测
-    121ms→1.9ms），失去前向计算意义（降级不是消失）；GPU 归因看层三 kernel 分类。
-  - **preprocess/sample/postprocess 的 V1↔V2 数值差异**：V2 注入只包内层单个方法，span 比 V1
-    同名 scope 窄/不同 → 名对齐、值不可直接比（引擎结构差异，非 bug）。
-  - **DP + EP（TP=1）+ eager 可用**：每个 DP rank 独立进程、TP=1 → 模型进程内可见。⚠️ 尚未实测。
-
-#### 层二：算子框架 scope（cpu_op，PyTorch/Kineto 自动）
-
-- `torch.profiler` 采 CPU activity 时，RecordFunction 在**每次算子 dispatch** 自动记一条
-  `cat="cpu_op"` 的 range（含 dispatch + launch 的 **CPU** 时间，不是 GPU 时间）。
-- name 三种来源：
-  - aten 内置：`aten::linear/matmul/mm`（GEMM 三层，**嵌套**，`linear⊃matmul⊃mm` 常同次数，
-    直接相加会重复计数）、`aten::copy_/to/reshape/slice/empty`（拷贝/视图/分配）；
-  - custom op：**vLLM 注册成功能名**（`unified_attention_with_output`/`moe_forward_shared`/
-    `fused_add_rms_norm`/`silu_and_mul`/`unified_kv_cache_update`）；**RTP 多为通用运算名，
-    或缺席**（手写 C++ 融合不走 dispatcher）；
-  - autograd Function 名（如 RTP GDN 的 `FusedRecurrentFunction`）。
-- 进阶：`ac2g`（correlation id）关联到 GPU kernel 时间；`record_shapes` 拿算子尺寸算带宽利用。
-- 跨引擎：**裸 aten / GEMM 可比**；但 **vLLM 组件有功能名可归因，RTP 的 attn/norm/激活是手写
-  C++ 融合、在 cpu_op 里隐身 → 组件归因对不齐**（RTP 组件归因要退回层三 kernel 名分类）。
-- **失效条件**：
-  - **RTP C++ 融合算子**：cpu_op 里没有对应条目（隐身）；
-  - **TP>1**：同层一，worker 子进程抓不到；
-  - **CUDA graph**：图内算子 replay 不再 dispatch、没有 per-op 启动开销 → **cpu_op 消失**。
-    （这正是 CG 的目的——消掉 per-op 启动开销，所以 cpu_op 无东西可记。）
-
-#### 层三：算子 GPU 时间（kernel，CUPTI 自动）
-
-- `torch.profiler` 加 `ProfilerActivity.CUDA` → Kineto 用 CUPTI 在 `cudaLaunchKernel` 处建立
-  关联，记录 kernel **稍后在 GPU 上执行的真实时间**，`cat="kernel"`。RTP 与 vLLM 完全一致。
-- **穿透 CUDA graph**：CG 下层一降级、层二消失，只有它还在。
-- **TP>1** 靠各引擎自己的 per-rank profiling（RTP `gen_timeline` / nsys / vLLM 原生 profiler）仍可拿到。
-- **谁发的 kernel 都抓**（含 RTP 手写 kernel）→ **跨引擎组件归因的唯一可靠层**，靠 kernel 名分类
-  （见方式 C 的 `perf_test_timeline`）。
-- 需手动精确计时某段可用 `torch.cuda.Event`。
-
-#### 一句话
-
-越往下越细、越接近真实 GPU 成本、越跨引擎可比：**层一/层二是 CPU 墙钟，CG 下失效或降级；
-部署路径（TP>1 + CUDA graph）下只有层三（kernel 名分类）可靠。**
-
-### RTP-LLM Profiling 对照
-
-RTP-LLM 内建 Kineto profiler，perf test 自动走 3 轮（warmup → measure → profile），timeline 输出在 `TEST_UNDECLARED_OUTPUTS_DIR/timelines/`。用 BUILD 文件的 env 控制：
-- `GEN_TIMELINE_SYNC=1`：同步 timeline
-- `PERF_PREARM_PROFILE=1`：预配置 profiler
-- `PERF_PROFILE_NUM_STEPS=4`：采集步数
+- **DP 汇总只输出 rank 0**（RTP 是全 rank 平均）。已验证 case 里 rank 间 spread <1%
+  可互换；若观察到差异变大，先改为输出全 rank 及均值再下结论
+- **fake-KV 为实验功能**：KV 全零、数值与真实 prefill 不同，仅用于 kernel 计时对齐
+- **RTP 有 FAKE_BALANCE_EXPERT（强制 MoE 均匀路由），vLLM 无等价物**：MoE decode
+  延迟可能存在轮间方差
+- **与 RTP 对比 MoE 组件归因只能靠 kernel 名分类**：RTP 的 attn/norm/激活是手写 C++
+  融合算子，在 cpu_op 层隐身
 
 ---
 
-## 多 DP Bench
-
-harness 支持 `--dp-size N`，自动启动 N 个进程，每个 rank 分到 `batch_size // dp_size` 个请求。
-
-- **Dense 模型**：各 rank 通过 `CUDA_VISIBLE_DEVICES` 隔离 GPU，完全独立运行
-- **MoE 模型（不开 EP）**：同 Dense，各 rank 独立加载全部 experts（TP 拆分）
-- **MoE 模型（开 EP）**：目前不支持跨 DP rank 的 EP（需要共享 distributed world），`--enable-expert-parallel` 仅在单 rank 或同 world 内生效
-
-### H20 DP=2 示例 (Qwen3-235B-A22B, TP=4)
-
-```bash
-cd /tmp
-export PATH=/usr/local/cuda-12.9/bin:/opt/conda310/bin:$PATH
-
-# BS=128, decode 30 步
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/muxue.xy/Qwen3-235B-A22B-Instruct-2507-FP8/ \
-  --mode decode \
-  --batch-sizes 128 --seq-lens 128 \
-  --num-iters 3 --num-decode-steps 30 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 512 --dtype auto \
-  --gpu-memory-utilization 0.9 \
-  --tp-size 4 --dp-size 2
-
-# BS=1024, decode 30 步（profile 激活 ~ local_bs×seq = 512×128；大到吃紧就减 batch/seq）
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
-  --model /home/muxue.xy/Qwen3-235B-A22B-Instruct-2507-FP8/ \
-  --mode decode \
-  --batch-sizes 1024 --seq-lens 128 \
-  --num-iters 3 --num-decode-steps 30 --num-warmup-iters 1 \
-  --enforce-eager --max-model-len 256 --dtype auto \
-  --gpu-memory-utilization 0.9 \
-  --tp-size 4 --dp-size 2
-```
-
-**注意事项**：
-- `batch_size` 必须 ≥ `dp_size` 且能整除
-- TP=4 DP=2 需要 8 张 GPU，通过 `CUDA_VISIBLE_DEVICES` 指定
-- 不需要设 `VLLM_ENABLE_V1_MULTIPROCESSING=0`，harness 内部自动设置
-- 235B 模型至少需要 TP=4 才能放进单个 DP rank 的显存（FP8 ~60GB/GPU）
-- profile_run 的激活显存由 `max_num_batched_tokens = max(local_bs × max(seq_lens), max_model_len)` 决定（harness 用 grid 里最大的 seq_len 而非 max_model_len 作上界，避免过度预留挤占 KV / profile OOM）。所以现在 `max_model_len` 只需 ≥ `seq_len + num_decode_steps`，不必再为了 profile 显存去压它；真正撑爆 profile 的是 `local_bs × max(seq_lens)`，大 BS + 长 seq 时才需要减小 batch 或 seq
-
-### 已知限制
-
-- **不支持跨 DP rank EP**：每个 DP rank 进程有独立的 torch.distributed world，无法形成跨 rank 的 NCCL EP group。MoE 大模型需要通过 TP 拆分 experts，而非 EP
-- **TP > 1 + DP + EP**：MultiProcExecutor 为每个 DP rank 创建独立的 distributed init，无法支持跨 DP 的 all-to-all
-
----
-
-## 已验证的对比结果
-
-> 所有 vLLM 延迟均为 **trimmed mean**（按轮排序、丢掉最小和最大、其余取平均，见
-> `_trimmed_mean`），对齐 RTP-LLM `batch_perf_impl.run` 的 `measurements[1:-1]`；
-> 不是 p50。
+## 9. 已验证的参考结果
 
 ### Qwen3-8B, BF16, single L20D (B300)
 
 | 引擎 | 模式 | BS | SeqLen | 延迟 (ms) |
 |---|---|---|---|---|
 | RTP-LLM | decode | 1 | 128 | 13.78 |
-| vLLM | decode | 1 | 128 | 13.73 (trimmed mean) |
-| vLLM | prefill | 1 | 128 | 14.53 (trimmed mean) |
+| vLLM | decode | 1 | 128 | 13.73 |
+| vLLM | prefill | 1 | 128 | 14.53 |
 
 ### Qwen3.5-35B-A3B-FP8, single H20
 
-| 模式 | BS | SeqLen | step trimmed(ms) | decode/tok(ms) | prefill(ms) |
-|---|---|---|---|---|---|
-| decode | 1 | 128 | 85.68 | 85.90 | 117.00 |
-| decode | 1 | 512 | 85.38 | 86.44 | 110.94 |
-| decode | 1 | 1024 | 84.96 | 85.03 | 110.43 |
-| decode | 4 | 128 | 87.04 | 87.08 | 111.26 |
-| decode | 4 | 512 | 86.91 | 86.94 | 110.92 |
-| decode | 4 | 1024 | 86.93 | 86.95 | 173.15 |
-| decode | 16 | 128 | 88.23 | 88.33 | 111.49 |
-| decode | 16 | 512 | 88.06 | 88.19 | 325.07 |
-| decode | 16 | 1024 | 87.90 | 88.06 | 626.79 |
+| 模式 | BS | SeqLen | decode/tok(ms) | prefill(ms) |
+|---|---|---|---|---|
+| decode | 1 | 128 | 85.90 | 117.00 |
+| decode | 1 | 1024 | 85.03 | 110.43 |
+| decode | 4 | 128 | 87.08 | 111.26 |
+| decode | 4 | 1024 | 86.95 | 173.15 |
+| decode | 16 | 128 | 88.33 | 111.49 |
+| decode | 16 | 1024 | 88.06 | 626.79 |
 
-### Qwen3-235B-A22B-FP8, DP=2 TP=4, H20 8×GPU
+### Qwen3-235B-A22B-FP8, TP=4 × DP=2 EP, 8×H20
 
-| BS (global) | SeqLen | Rank 0 step trimmed(ms) | Rank 1 step trimmed(ms) |
+| BS (global) | SeqLen | Rank 0 (ms) | Rank 1 (ms) |
 |---|---|---|---|
 | 128 | 128 | 123.75 | 126.19 |
 | 1024 | 128 | 127.74 | 126.45 |
-
-各 rank per-step 延迟接近（差异 <3%）。

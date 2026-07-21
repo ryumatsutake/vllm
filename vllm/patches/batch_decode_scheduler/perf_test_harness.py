@@ -53,8 +53,9 @@ def _force_vllm_scopes() -> None:
     scopes. The ``--vllm-scopes`` runner flag sets VLLM_USE_V2_MODEL_RUNNER=0 so
     the scoped V1 runner is used; this function only handles the on/off gating.
     """
-    import vllm.v1.utils as U
     from torch.autograd.profiler import record_function
+
+    import vllm.v1.utils as U
 
     U._PROFILER_FUNC = record_function
 
@@ -131,8 +132,9 @@ def _install_scope_patches(worker, wrap_forward: bool = False) -> None:
 
     Idempotent. Must be module-level so cloudpickle can resolve it under spawn.
     """
-    import vllm.v1.utils as U
     from torch.autograd.profiler import record_function
+
+    import vllm.v1.utils as U
 
     U._PROFILER_FUNC = record_function
 
@@ -187,6 +189,61 @@ def _install_scope_patches(worker, wrap_forward: bool = False) -> None:
     mr._scopes_installed = True
 
 
+# Token id fed to the scheduler AND written into each rank's runner state as
+# the "sampled" first token of the fake prefill (submit_decode_only).
+_FAKE_TOKEN_ID = 1
+
+
+def _register_requests_no_forward(worker, scheduler_output) -> None:
+    """Register scheduled requests in a worker's model_runner without forward.
+
+    Runs on every rank via ``executor.collective_rpc`` (TP=1 UniProc live
+    call; TP>1 MultiprocExecutor ships this function via cloudpickle and
+    invokes it as ``func(worker, scheduler_output)``). SchedulerOutput is
+    already pickled over the same broadcast MQ on every normal step, so
+    shipping it here is equally safe.
+
+    Mirrors the state-update prologue of execute_model for both runners
+    (V1: _update_states; V2: finish/free/add/update + staged block-table
+    writes) so KV blocks are registered but no forward ever runs.
+
+    CRITICAL: the first decode step reads the "sampled" token of the skipped
+    prefill from runner-local state that is normally written by the sampler
+    path we skipped. Leaving it unwritten reads uninitialized memory — V1's
+    token_ids_cpu slot held heap garbage -> embedding index out-of-bounds
+    (device-side assert, observed on TP=1). Both branches below therefore
+    also mirror the post-sampling bookkeeping with _FAKE_TOKEN_ID.
+    Must be module-level so cloudpickle can resolve it under spawn.
+    """
+    model_runner = worker.model_runner
+    if hasattr(model_runner, '_update_states'):
+        model_runner._update_states(scheduler_output)
+        # Mirror gpu_model_runner's post-sampling bookkeeping (execute_model
+        # writes sampled ids into input_batch on the last PP rank; the
+        # scheduler never sends them back).
+        input_batch = model_runner.input_batch
+        for req_id in scheduler_output.num_scheduled_tokens:
+            idx = input_batch.req_id_to_index[req_id]
+            start = int(input_batch.num_tokens_no_spec[idx])
+            input_batch.token_ids_cpu[idx, start] = _FAKE_TOKEN_ID
+            input_batch.is_token_ids[idx, start] = True
+            input_batch.num_tokens_no_spec[idx] = start + 1
+            model_runner.requests[req_id].output_token_ids.append(_FAKE_TOKEN_ID)
+    else:
+        model_runner.finish_requests(scheduler_output)
+        model_runner.free_states(scheduler_output)
+        model_runner.add_requests(scheduler_output)
+        model_runner.update_requests(scheduler_output)
+        model_runner.block_tables.apply_staged_writes()
+        # V2 keeps the decode input token in req_states.last_sampled_tokens
+        # (zero-init, so it would read token 0 — valid but arbitrary). Write
+        # the same fake token the scheduler was fed, for determinism.
+        req_states = model_runner.req_states
+        for req_id in scheduler_output.num_scheduled_tokens:
+            idx = req_states.req_id_to_index[req_id]
+            req_states.last_sampled_tokens[idx : idx + 1] = _FAKE_TOKEN_ID
+
+
 @dataclass
 class StepStat:
     forward_ms: float
@@ -227,6 +284,7 @@ class BenchHarness:
         scope_forward: bool = False,
     ):
         self._dp_barrier = dp_barrier
+        self._shutdown = False
 
         # Token budget must admit the largest single-step batch without chunking:
         # both real prefill and the fake-KV decode-only setup go through a real
@@ -302,6 +360,13 @@ class BenchHarness:
             self.executor.collective_rpc(
                 _install_scope_patches, args=(scope_forward,)
             )
+
+    def shutdown(self) -> None:
+        """Shut down EngineCore and its workers exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.llm.llm_engine.engine_core.shutdown()
 
     def submit(
         self,
@@ -462,13 +527,27 @@ class BenchHarness:
                 f"raise --gpu-memory-utilization."
             )
 
+    def assert_prefill_tokens(
+        self,
+        stat: StepStat,
+        expected_bs: int,
+        expected_seq_len: int,
+    ) -> None:
+        """Assert prefill completed the entire batch in one scheduler step."""
+        expected_tokens = expected_bs * expected_seq_len
+        if stat.num_scheduled_tokens != expected_tokens:
+            raise AssertionError(
+                f"Expected {expected_tokens} prefill tokens in one step, got "
+                f"{stat.num_scheduled_tokens}; prefill was chunked or clipped."
+            )
+
     def mark_batch_start(self) -> None:
-        """Record batch start time (after cuda sync). Aligns with RTP-LLM resetBeginTime."""
+        """Record batch start after cuda sync, aligned with RTP resetBeginTime."""
         torch.cuda.synchronize()
         self._batch_start = time.perf_counter()
 
     def mark_batch_end(self) -> float:
-        """Record batch end time, return cost_time_ms. Aligns with RTP-LLM cost_time_us."""
+        """Record batch end and return ms, aligned with RTP cost_time_us."""
         torch.cuda.synchronize()
         return (time.perf_counter() - self._batch_start) * 1000
 
@@ -592,9 +671,10 @@ class BenchHarness:
         """Submit requests and fast-forward past prefill without running forward.
 
         Allocates KV blocks via normal scheduling, registers requests in
-        model_runner via _update_states, but skips the actual prefill forward.
-        KV cache content is zeroed (not computed), matching RTP-LLM's
-        setIsContextStream(false) behavior.
+        every rank's model_runner via collective_rpc, but skips the actual
+        prefill forward. KV cache content is zeroed (not computed), matching
+        RTP-LLM's setIsContextStream(false) behavior. Works for TP=1 and
+        TP>1 (the registration fans out to all worker processes).
         """
         req_ids = self.submit(
             batch_size, seq_len,
@@ -610,28 +690,17 @@ class BenchHarness:
         return req_ids
 
     def _register_without_forward(self, scheduler_output):
-        """Register requests in model_runner without running forward.
+        """Register requests in every rank's model_runner without forward.
 
-        Handles both V1 (_update_states) and V2 (finish/add/update) model runners.
-        Only works with InprocExecutor (TP=1). MultiprocExecutor (TP>1) runs
-        workers in subprocesses where driver_worker is not directly accessible.
+        Fans out to all workers via collective_rpc — TP=1 (UniProc, live
+        call) and TP>1 (MultiprocExecutor, cloudpickle over the broadcast
+        MQ) both work; each TP rank must register the requests so its
+        per-rank runner state (block tables, seq lens) matches the
+        scheduler before the first decode step.
         """
-        if not hasattr(self.executor, 'driver_worker'):
-            raise RuntimeError(
-                "--skip-prefill-forward is not supported with TP>1. "
-                "MultiprocExecutor does not expose driver_worker. "
-                "Use normal prefill (remove --skip-prefill-forward) instead."
-            )
-        worker = self.executor.driver_worker
-        model_runner = worker.model_runner
-        if hasattr(model_runner, '_update_states'):
-            model_runner._update_states(scheduler_output)
-        else:
-            model_runner.finish_requests(scheduler_output)
-            model_runner.free_states(scheduler_output)
-            model_runner.add_requests(scheduler_output)
-            model_runner.update_requests(scheduler_output)
-            model_runner.block_tables.apply_staged_writes()
+        self.executor.collective_rpc(
+            _register_requests_no_forward, args=(scheduler_output,)
+        )
 
     def _fake_update_from_output(self, scheduler_output):
         """Fabricate ModelRunnerOutput so scheduler advances past prefill."""
@@ -639,7 +708,9 @@ class BenchHarness:
 
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
-        fake_token_ids = [[1]] * len(req_ids)
+        # One list per request — [[x]] * n would alias a single inner list
+        # across all requests, a hazard if downstream ever mutates in place.
+        fake_token_ids = [[_FAKE_TOKEN_ID] for _ in req_ids]
 
         fake_output = ModelRunnerOutput(
             req_ids=req_ids,
