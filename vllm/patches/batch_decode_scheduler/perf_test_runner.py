@@ -403,6 +403,7 @@ def _run_bench_grid(
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        fake_kv_registration=skip_prefill,
         dp_barrier=dp_barrier,
         disable_mm=args.disable_mm,
         worker_profiler_dir=args.worker_profile_dir,

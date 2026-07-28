@@ -193,6 +193,17 @@ def _install_scope_patches(worker, wrap_forward: bool = False) -> None:
 # the "sampled" first token of the fake prefill (submit_decode_only).
 _FAKE_TOKEN_ID = 1
 
+# Token-budget cap for the fake-KV setup (submit_decode_only). Registration
+# needs no forward, so the budget only sizes runner buffers (inputs_embeds is
+# max_num_batched_tokens x hidden on BOTH pinned host and device memory) and
+# the profile_run activation reservation. bs x seq at large shapes made those
+# allocations fail before a single decode step could run; prompts register
+# over multiple scheduler rounds instead. Cap at 64Ki tokens: this host
+# rejects single pinned allocations above ~1 GiB (cudaHostAlloc invalid
+# argument), and 64Ki x hidden 5120 x bf16 = 640 MiB stays safely below
+# that; longer prompts are admitted through the max_seq_len floor below.
+_FAKE_KV_TOKEN_BUDGET_CAP = 65536
+
 
 def _register_requests_no_forward(worker, scheduler_output) -> None:
     """Register scheduled requests in a worker's model_runner without forward.
@@ -277,6 +288,7 @@ class BenchHarness:
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         enable_expert_parallel: bool = False,
+        fake_kv_registration: bool = False,
         dp_barrier=None,
         disable_mm: bool = False,
         worker_profiler_dir: str | None = None,
@@ -300,6 +312,17 @@ class BenchHarness:
         if max_seq_len is None:
             max_seq_len = max_model_len
         max_num_batched_tokens = max(max_batch_size * max_seq_len, max_model_len)
+        if fake_kv_registration:
+            # Decode-only (--partial 1): no prefill forward ever runs, so the
+            # budget must merely admit one full prompt per scheduler round
+            # alongside the already-running decode tokens. Keep it capped or
+            # the runner's per-token buffers and profile_run's activation
+            # reservation scale with bs x seq and OOM before decode starts.
+            max_num_batched_tokens = max(
+                min(max_num_batched_tokens, _FAKE_KV_TOKEN_BUDGET_CAP),
+                max_model_len,
+                max_seq_len + max_batch_size + 64,
+            )
 
         if dp_barrier is not None:
             self._patch_executor_for_dp_sync(dp_barrier)
@@ -678,14 +701,39 @@ class BenchHarness:
         """
         req_ids = self.submit(
             batch_size, seq_len,
-            max_tokens=num_decode_steps + 1,
+            # registration may take up to batch_size scheduler rounds; every
+            # round fake-advances the already-registered requests by one
+            # token, so pad the allowance to keep the measured decode steps
+            # from finishing anyone early (ignore_eos + explicit drain).
+            max_tokens=num_decode_steps + batch_size + 1,
             ignore_eos=True,
         )
 
-        scheduler_output = self.scheduler.schedule()
-
-        self._register_without_forward(scheduler_output)
-        self._fake_update_from_output(scheduler_output)
+        # With the fake-KV token budget capped, one schedule() round may only
+        # admit part of the batch; loop until every request is registered.
+        pending = set(req_ids)
+        stalled_rounds = 0
+        while pending:
+            scheduler_output = self.scheduler.schedule()
+            if scheduler_output.num_scheduled_tokens:
+                self._register_without_forward(scheduler_output)
+                self._fake_update_from_output(scheduler_output)
+            newly_registered = pending & set(
+                scheduler_output.num_scheduled_tokens
+            )
+            if newly_registered:
+                pending -= newly_registered
+                stalled_rounds = 0
+                continue
+            stalled_rounds += 1
+            if stalled_rounds > 16:
+                raise AssertionError(
+                    f"Expected {batch_size} reqs registered for fake-KV "
+                    f"decode, {len(pending)} still waiting after "
+                    f"{stalled_rounds} stalled rounds — batch was split "
+                    f"(KV-cache OOM). Lower --batch-sizes/--seq-lens or "
+                    f"raise --gpu-memory-utilization."
+                )
 
         return req_ids
 
