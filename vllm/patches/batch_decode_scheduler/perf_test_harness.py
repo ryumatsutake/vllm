@@ -8,10 +8,9 @@ dispatch), excluding schedule(). BatchDecodeScheduler's inter-step
 scheduling overhead is negligible (<100μs), so the two are comparable.
 
 Known differences vs RTP-LLM perf test:
-- No FAKE_BALANCE_EXPERT: RTP-LLM forces uniform expert routing in MoE
-  models for stable benchmarks. vLLM has no equivalent; expert routing
-  follows the model's gating network. This may cause variance in MoE
-  decode latency across runs.
+- FAKE_BALANCE_EXPERT uses two in-place CUDA kernels after the real top-k;
+  RTP-LLM uses one dedicated kernel. Both produce the same deterministic
+  expert IDs and unit weights, but their routing overhead is not identical.
 - DP via runner only: harness itself is single-process (InprocClient).
   DP is supported by the runner, which spawns one harness per DP rank.
   See perf_test_runner.py --dp-size for DP+EP benchmarks.
@@ -83,6 +82,143 @@ _V2_FORWARD_TARGETS: list[tuple[str, str]] = [
     ("cudagraph_manager", "run_pw_graph"),
     ("model", "forward"),
 ]
+
+
+def _audit_fake_balance_experts(worker) -> dict[str, object]:
+    """Return fake-balance status for every MoE layer on one worker."""
+    from vllm.utils import is_moe_layer
+
+    model_runner = worker.model_runner
+    get_model = getattr(model_runner, "get_model", None)
+    model = get_model() if callable(get_model) else model_runner.model
+
+    layers: list[dict[str, object]] = []
+    for module in model.modules():
+        if not is_moe_layer(module):
+            continue
+
+        quant_method = getattr(module, "_quant_method", None)
+        parallel_config = getattr(
+            getattr(module, "moe_config", None),
+            "moe_parallel_config",
+            None,
+        )
+        wrapper = getattr(module, "_fake_balance_select_experts", None)
+        router = getattr(module, "router", None)
+        wrapped = (
+            wrapper is not None
+            and router is not None
+            and getattr(router, "select_experts", None) is wrapper
+            and getattr(wrapper, "_fake_balance_expert", False)
+        )
+        template = getattr(module, "_fake_balance_template", None)
+        key = getattr(module, "_fake_balance_template_key", None)
+        key_capacity = None
+        fake_dp_rank = None
+        fake_dp_size = None
+        if isinstance(key, tuple) and len(key) == 7:
+            key_capacity = key[2]
+            fake_dp_rank = key[5]
+            fake_dp_size = key[6]
+        capacity_valid = (
+            template is not None
+            and key_capacity is not None
+            and template.numel() == key_capacity
+        )
+        is_monolithic = bool(getattr(module, "is_monolithic", False))
+        eplb_enabled = bool(getattr(parallel_config, "enable_eplb", False))
+        finalized = bool(getattr(module, "_fake_balance_finalized", False))
+        enabled = bool(getattr(module, "_fake_balance_enabled", False))
+        ready = (
+            enabled
+            and finalized
+            and wrapped
+            and capacity_valid
+            and not is_monolithic
+            and not eplb_enabled
+        )
+
+        errors = []
+        if not enabled:
+            errors.append("fake balance is not enabled")
+        if is_monolithic:
+            errors.append("monolithic MoE kernel")
+        if eplb_enabled:
+            errors.append("EPLB is enabled")
+        if not finalized:
+            errors.append("finalization did not run")
+        if not wrapped:
+            errors.append("router wrapper is missing")
+        if template is None:
+            errors.append("routing template is missing")
+        elif not capacity_valid:
+            errors.append("routing template capacity does not match its key")
+
+        layers.append(
+            {
+                "layer": getattr(module, "layer_name", type(module).__name__),
+                "ready": ready,
+                "enabled": enabled,
+                "finalized": finalized,
+                "wrapped": wrapped,
+                "template_present": template is not None,
+                "errors": errors,
+                "kernel": getattr(quant_method, "method_name", None),
+                "capacity": 0 if template is None else template.numel(),
+                "template_key": None if key is None else repr(key),
+                "ep_size": getattr(parallel_config, "ep_size", None),
+                "dp_rank": getattr(parallel_config, "dp_rank", None),
+                "dp_size": getattr(parallel_config, "dp_size", None),
+                "fake_dp_rank": fake_dp_rank,
+                "fake_dp_size": fake_dp_size,
+            }
+        )
+
+    return {
+        "rank": getattr(worker, "rank", None),
+        "moe_layer_count": len(layers),
+        "finalized_layer_count": sum(bool(layer["ready"]) for layer in layers),
+        "layers": layers,
+    }
+
+
+def _validate_fake_balance_audits(
+    audits: list[dict[str, object]],
+    *,
+    expected_enabled: bool = True,
+) -> None:
+    failures = []
+    for worker_index, audit in enumerate(audits):
+        moe_count = int(audit["moe_layer_count"])
+        finalized_count = int(audit["finalized_layer_count"])
+        layers = audit["layers"]
+        assert isinstance(layers, list)
+        if expected_enabled:
+            failed_layers = [layer for layer in layers if not layer["ready"]]
+            status = f"finalized {finalized_count}/{moe_count}"
+        else:
+            failed_layers = [
+                layer
+                for layer in layers
+                if layer["enabled"]
+                or layer["finalized"]
+                or layer["wrapped"]
+                or layer["template_present"]
+            ]
+            status = f"disabled but active on {len(failed_layers)}/{moe_count}"
+        if not failed_layers:
+            continue
+        omitted = len(failed_layers) - 5
+        suffix = f" (+{omitted} more)" if omitted > 0 else ""
+        failures.append(
+            f"worker {worker_index} (rank={audit['rank']}): "
+            f"{status}; "
+            f"{failed_layers[:5]}{suffix}"
+        )
+    if failures:
+        raise RuntimeError(
+            "FAKE_BALANCE_EXPERT worker audit failed:\n" + "\n".join(failures)
+        )
 
 
 def _make_scoped(fn, scope_name: str, reentry_guard=None):
@@ -294,9 +430,13 @@ class BenchHarness:
         worker_profiler_dir: str | None = None,
         inject_scopes: bool = False,
         scope_forward: bool = False,
+        fake_balance_expert: bool = True,
     ):
         self._dp_barrier = dp_barrier
         self._shutdown = False
+        os.environ["FAKE_BALANCE_EXPERT"] = (
+            "1" if fake_balance_expert else "0"
+        )
 
         # Token budget must admit the largest single-step batch without chunking:
         # both real prefill and the fake-KV decode-only setup go through a real
@@ -370,6 +510,23 @@ class BenchHarness:
         engine_core = getattr(client, 'engine_core', client)
         self.scheduler = engine_core.scheduler
         self.executor = engine_core.model_executor
+
+        self.fake_balance_audits = self.executor.collective_rpc(
+            _audit_fake_balance_experts
+        )
+        _validate_fake_balance_audits(
+            self.fake_balance_audits,
+            expected_enabled=fake_balance_expert,
+        )
+        moe_layers = sum(
+            int(audit["moe_layer_count"])
+            for audit in self.fake_balance_audits
+        )
+        state = "enabled" if fake_balance_expert else "disabled"
+        print(
+            f"Fake balance audit: {state}, "
+            f"workers={len(self.fake_balance_audits)}, moe_layers={moe_layers}"
+        )
 
         self.block_size = self.scheduler.block_size
         init_none_hash(sha256)

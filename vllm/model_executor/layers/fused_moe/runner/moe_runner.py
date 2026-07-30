@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -55,6 +56,82 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+_FAKE_BALANCE_EXPERT_ENV = "FAKE_BALANCE_EXPERT"
+_FAKE_BALANCE_DP_RANK_ENV = "FAKE_BALANCE_DP_RANK"
+_FAKE_BALANCE_DP_SIZE_ENV = "FAKE_BALANCE_DP_SIZE"
+
+_FakeBalanceTemplateKey = tuple[
+    str,
+    torch.dtype,
+    int,
+    int,
+    int,
+    int,
+    int,
+]
+_FAKE_BALANCE_TEMPLATE_CACHE: dict[_FakeBalanceTemplateKey, torch.Tensor] = {}
+
+
+def _fake_balance_expert_enabled() -> bool:
+    return os.environ.get(_FAKE_BALANCE_EXPERT_ENV) == "1"
+
+
+def _read_fake_balance_dp_config(
+    configured_rank: int,
+    configured_size: int,
+) -> tuple[int, int]:
+    if configured_size > 1:
+        return configured_rank, configured_size
+
+    rank = int(os.environ.get(_FAKE_BALANCE_DP_RANK_ENV, "0"))
+    size = int(os.environ.get(_FAKE_BALANCE_DP_SIZE_ENV, "1"))
+    if size <= 0 or rank < 0 or rank >= size:
+        raise ValueError(
+            "Invalid fake-balance DP configuration: "
+            f"rank={rank}, size={size}"
+        )
+    return rank, size
+
+
+def _make_fake_balance_template(
+    capacity: int,
+    num_experts: int,
+    ep_size: int,
+    dp_rank: int,
+    dp_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the deterministic routing sequence used by RTP-LLM."""
+    if capacity <= 0:
+        raise ValueError(
+            f"Fake-balance template capacity must be positive: {capacity}"
+        )
+    if ep_size <= 0 or num_experts % ep_size != 0:
+        raise ValueError(
+            "Fake-balance routing requires experts to divide evenly across EP "
+            f"ranks: num_experts={num_experts}, ep_size={ep_size}"
+        )
+    if dp_size <= 0 or dp_rank < 0 or dp_rank >= dp_size:
+        raise ValueError(
+            "Invalid fake-balance DP configuration: "
+            f"rank={dp_rank}, size={dp_size}"
+        )
+
+    local_experts = num_experts // ep_size
+    ep_rank_offset = ep_size * dp_rank // dp_size
+    local_expert_offset = int(
+        dp_rank * max(float(local_experts) / dp_size, 1.0)
+    ) % local_experts
+
+    indices = torch.arange(capacity, device=device, dtype=torch.int64)
+    dest_ep_rank = (ep_rank_offset + indices % ep_size) % ep_size
+    dest_local_expert = (
+        local_expert_offset + torch.div(indices, ep_size, rounding_mode="floor")
+    ) % local_experts
+    return (dest_ep_rank * local_experts + dest_local_expert).to(dtype=dtype)
 
 
 def register_layer_for_moe_forward_op(
@@ -260,7 +337,15 @@ class MoERunner(MoERunnerInterface):
         self.router = router
         self.routed_input_transform = routed_input_transform
         self.routed_output_transform = routed_output_transform
-        self.routed_scaling_factor = routed_scaling_factor
+        self._fake_balance_enabled = _fake_balance_expert_enabled()
+        self._fake_balance_finalized = False
+        self._fake_balance_template: torch.Tensor | None = None
+        self._fake_balance_template_key: _FakeBalanceTemplateKey | None = None
+        self._fake_balance_select_experts: Callable | None = None
+        self._fake_balance_original_select_experts: Callable | None = None
+        self.routed_scaling_factor = (
+            1.0 if self._fake_balance_enabled else routed_scaling_factor
+        )
         self.gate = gate
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
@@ -316,6 +401,134 @@ class MoERunner(MoERunnerInterface):
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts._replace_quant_method(quant_method)
+
+    def _fake_balance_capacity(self) -> int:
+        parallel_config = self.moe_config.moe_parallel_config
+        dispatch_factor = 1
+        if self.do_naive_dispatch_combine:
+            dispatch_factor *= (
+                parallel_config.ep_size
+                if parallel_config.is_sequence_parallel
+                else parallel_config.dp_size
+            )
+        dispatch_factor *= parallel_config.pcp_size
+        return (
+            self.moe_config.max_num_tokens
+            * dispatch_factor
+            * self.moe_config.experts_per_token
+        )
+
+    def finalize_fake_balance(self) -> None:
+        """Prepare fake routing after the final MoE kernel is selected."""
+        if not self._fake_balance_enabled:
+            return
+        if not current_platform.is_cuda():
+            raise RuntimeError("FAKE_BALANCE_EXPERT is supported only on CUDA")
+        if self._quant_method.is_monolithic:
+            raise RuntimeError(
+                "FAKE_BALANCE_EXPERT requires a modular MoE kernel; "
+                f"{self.layer_name} selected {self._quant_method.method_name}"
+            )
+        if isinstance(self.router, ZeroExpertRouter):
+            raise RuntimeError("FAKE_BALANCE_EXPERT does not support ZeroExpertRouter")
+
+        parallel_config = self.moe_config.moe_parallel_config
+        if parallel_config.enable_eplb:
+            raise RuntimeError("FAKE_BALANCE_EXPERT does not support EPLB")
+        if self.expert_placement_strategy != "linear":
+            raise RuntimeError(
+                "FAKE_BALANCE_EXPERT requires linear expert placement, "
+                f"got {self.expert_placement_strategy}"
+            )
+        if self.moe_config.num_experts != self.moe_config.num_logical_experts:
+            raise RuntimeError(
+                "FAKE_BALANCE_EXPERT requires physical and logical expert counts "
+                "to match"
+            )
+
+        dp_rank, dp_size = _read_fake_balance_dp_config(
+            parallel_config.dp_rank,
+            parallel_config.dp_size,
+        )
+        dtype = self._quant_method.topk_indices_dtype or torch.int32
+        if dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                "FAKE_BALANCE_EXPERT requires int32 or int64 expert IDs, "
+                f"got {dtype}"
+            )
+
+        device = torch.device(self.moe_config.device)
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        capacity = self._fake_balance_capacity()
+        key: _FakeBalanceTemplateKey = (
+            str(device),
+            dtype,
+            capacity,
+            self.moe_config.num_experts,
+            parallel_config.ep_size,
+            dp_rank,
+            dp_size,
+        )
+        if (
+            self._fake_balance_finalized
+            and self._fake_balance_template_key == key
+            and self.router.select_experts is self._fake_balance_select_experts
+        ):
+            return
+        if self._fake_balance_finalized:
+            raise RuntimeError(
+                "FAKE_BALANCE_EXPERT configuration changed after finalization"
+            )
+
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FAKE_BALANCE_EXPERT must be finalized before CUDA graph capture"
+                )
+            template = _FAKE_BALANCE_TEMPLATE_CACHE.get(key)
+            if template is None:
+                template = _make_fake_balance_template(
+                    capacity=capacity,
+                    num_experts=self.moe_config.num_experts,
+                    ep_size=parallel_config.ep_size,
+                    dp_rank=dp_rank,
+                    dp_size=dp_size,
+                    dtype=dtype,
+                    device=device,
+                )
+                _FAKE_BALANCE_TEMPLATE_CACHE[key] = template
+
+        self._fake_balance_template = template
+        self._fake_balance_template_key = key
+
+        if self._fake_balance_select_experts is None:
+            original_select_experts = self.router.select_experts
+            self._fake_balance_original_select_experts = original_select_experts
+
+            def fake_balance_select_experts(*args, **kwargs):
+                topk_weights, topk_ids = original_select_experts(*args, **kwargs)
+                template = self._fake_balance_template
+                assert template is not None
+                numel = topk_ids.numel()
+                if numel > template.numel():
+                    raise RuntimeError(
+                        "FAKE_BALANCE_EXPERT template is too small: "
+                        f"required={numel}, capacity={template.numel()}"
+                    )
+                topk_ids.copy_(template[:numel].view_as(topk_ids))
+                topk_weights.fill_(1.0)
+                return topk_weights, topk_ids
+
+            setattr(fake_balance_select_experts, "_fake_balance_expert", True)
+            self._fake_balance_select_experts = fake_balance_select_experts
+            setattr(self.router, "select_experts", fake_balance_select_experts)
+        elif self.router.select_experts is not self._fake_balance_select_experts:
+            raise RuntimeError(
+                f"FAKE_BALANCE_EXPERT router hook was replaced for {self.layer_name}"
+            )
+
+        self._fake_balance_finalized = True
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -976,3 +1189,16 @@ class MoERunner(MoERunnerInterface):
                 logical_to_physical_map,
                 logical_replica_count,
             )
+
+
+def finalize_fake_balance_for_model(model: torch.nn.Module) -> int:
+    """Finalize fake-balance routing for every standard MoE runner."""
+    if not _fake_balance_expert_enabled():
+        return 0
+
+    finalized = 0
+    for module in model.modules():
+        if isinstance(module, MoERunner):
+            module.finalize_fake_balance()
+            finalized += 1
+    return finalized

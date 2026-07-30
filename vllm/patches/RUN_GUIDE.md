@@ -112,6 +112,7 @@ python3 -u -m vllm.patches.batch_decode_scheduler.perf_test_runner \
 | `--enforce-eager` | 关 CUDA graph / torch.compile；要看清 kernel 语义名或用 scope 时必开 |
 | `--tp-size` / `--pp-size` / `--dp-size` | 并行配置（见 §4） |
 | `--enable-expert-parallel` | MoE 开 EP（配合 `--dp-size` 见 §4.2） |
+| `--disable-fake-balance-expert` | 关闭默认的 RTP 对齐 fake-balance 路由，使用真实 gating；用于 A/B 对照 |
 | `--disable-mm` | VL 模型只测语言部分：清零多模态槽位，跳过视觉塔显存 profiling |
 | `--output` | CSV 输出路径 |
 
@@ -284,10 +285,14 @@ timeline 在 bazel testlogs 的 `test.outputs/timelines/` 下；BUILD env 里
 - **DP 汇总只输出 rank 0**（RTP 是全 rank 平均）。已验证 case 里 rank 间 spread <1%
   可互换；若观察到差异变大，先改为输出全 rank 及均值再下结论
 - **fake-KV 为实验功能**：KV 全零、数值与真实 prefill 不同，仅用于 kernel 计时对齐
-- **RTP 有 FAKE_BALANCE_EXPERT（强制 MoE 均匀路由），vLLM 无等价物**：MoE decode
-  延迟可能存在轮间方差
+- **MoE fake balance 已对齐 RTP**：harness 无条件设置 `FAKE_BALANCE_EXPERT=1`，
+  真实 top-k 后按 RTP 的 EP/local-expert 两级 round-robin 覆写 expert IDs，并把权重置
+  为 1。vLLM 热路径是 `copy_ + fill_` 两个原地 CUDA kernel，RTP 是单个专用 kernel，
+  因此负载分布一致，但路由开销不应视为严格相同。该模式要求 CUDA modular MoE、默认
+  `linear` expert placement，且不能同时启用 EPLB
 - **与 RTP 对比 MoE 组件归因只能靠 kernel 名分类**：RTP 的 attn/norm/激活是手写 C++
-  融合算子，在 cpu_op 层隐身
+  融合算子，在 cpu_op 层隐身；vLLM fake balance 的通用 `copy_`/`fill_` kernel 也可能落入
+  `Other`，但端到端延迟仍完整包含这两次 launch
 
 ---
 

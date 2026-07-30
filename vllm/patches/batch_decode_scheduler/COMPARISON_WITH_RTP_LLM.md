@@ -344,9 +344,11 @@ vLLM 的每个 DP rank 是**独立进程、独立 `torch.distributed` world**，
 
 - **RTP-LLM**：`FAKE_BALANCE_EXPERT` 环境变量强制专家均匀路由，使 MoE decode 延迟
   稳定可复现。
-- **vLLM 版**：**没有等价物**（harness docstring 明确写了）。专家路由跟随模型
-  gating 网络，同样输入下 MoE decode 延迟会有 run-to-run 抖动。做 MoE 对比时要注意
-  这个系统性差异。
+- **vLLM 版**：harness 同样无条件设置 `FAKE_BALANCE_EXPERT=1`。真实 top-k 仍会执行，
+  随后按 RTP 的 EP/local-expert 两级 round-robin 覆写 expert IDs，并把权重置为 1；每个
+  worker 在测量前通过 `collective_rpc` 审计所有 MoE 层，禁止静默 no-op。
+- **剩余差异**：vLLM 用缓存模板的 `copy_ + fill_` 两个原地 CUDA kernel，RTP 用单个
+  `fakeBalanceExpertKernel`。二者负载分布和权重一致，但路由 kernel 开销不完全相同。
 
 ---
 
@@ -507,7 +509,7 @@ RTP-LLM 有、vLLM 版**目前没有**的功能：
 | 指标公式 | `(cost-prefill)/steps` 定义方 | 严格对齐 RTP |
 | 聚合 | trimmed mean，采样单位=请求 | trimmed mean，采样单位=round |
 | DP+EP | 原生分布式 world | monkey-patch `Barrier` |
-| MoE 稳定 | `FAKE_BALANCE_EXPERT` | 无（有抖动） |
+| MoE 稳定 | `FAKE_BALANCE_EXPERT` 单 kernel | `FAKE_BALANCE_EXPERT`，`copy_ + fill_` |
 | VL 模型 | 原生按 text 跑 | `--disable-mm` 清零 mm 槽位 |
 | Profiling 采集 | 服务端 `gen_timeline` | `--profile`(torch, TP=1) / `--worker-profile-dir`(WorkerProfiler, TP>1) |
 | kernel 分类器 | `analyze_timeline.py` | `perf_test_timeline.py`（对齐 taxonomy） |
@@ -653,11 +655,11 @@ RTP-LLM 同样用 `setIsContextStream(false)` 完全跳过 prefill;长序列 + �
 | **Dense** | **不影响** | decode 成本 = 读 KV 做 attention(访存带宽瓶颈)+ projection/MLP GEMM + sampler,只取决于 KV 的**形状/布局/dtype/数量**,不取决于**数值**。"访存量真、数值假"——而 decode 压测量的就是访存量 |
 | **MoE** | **影响,需额外处理** | 专家路由(gating)按 hidden state **数值**选专家;garbage KV → garbage hidden state → 随机/畸形路由 → 专家负载不均 → **每轮方差大、专家利用率不代表真实分布** |
 
-**MoE 均衡缺口〔事实〕**:RTP-LLM 用 `FAKE_BALANCE_EXPERT` 强制均匀路由解决上述方差。
-**vLLM 侧没有直接对应的旋钮**——它有 `EPLBConfig`(`vllm/config/parallel.py:57`)+
-`log_balancedness`,但那是运行时**真的搬迁专家**的负载均衡器,不是"强制假均匀路由"的压测开关。
-所以**测 MoE 的长序列大 batch decode 时,除伪造 KV 外还需自己补一个"强制均衡路由"shim**
-(patch gating 让每 token 均匀落专家),否则数字不稳。Dense 模型无此问题。
+**MoE 均衡已对齐〔事实〕**:vLLM harness 与 RTP-LLM 一样无条件启用
+`FAKE_BALANCE_EXPERT`。vLLM 保留真实 top-k 的开销,随后按 RTP 公式覆写 expert IDs 和
+weights；模板在 profile/CUDA Graph capture 前创建并由同配置 MoE 层共享。`EPLBConfig`
+(`vllm/config/parallel.py:57`)仍是另一类功能——它会运行时搬迁专家，fake balance 模式明确
+拒绝与 EPLB 同时启用。Dense 模型不受该开关影响。
 
 ### 11.3 伪造 KV 这条路的现状:TP 无关 + 残留成本
 
@@ -693,11 +695,12 @@ collective_rpc 函数,版本升级只需盯这一处。〔评价〕
 | 定长批 | stock `Scheduler` + 受控提交 | 贪婪调度器天然产出定长批(`scheduler.py:629-631`) |
 | 跳 prefill | **保留伪造 KV**(真 prefill 物理不可行),`_register_without_forward` 已 `collective_rpc` 化、TP=1/TP>1 均支持 | `perf_test_harness.py:197/701` |
 | Dense 稳定性 | 无需额外处理 | 数值假不影响访存型 decode 成本 |
-| MoE 稳定性 | 需补"强制均衡路由"shim | vLLM 无 `FAKE_BALANCE_EXPERT` 对应,EPLB(`config/parallel.py:57`)是真搬专家非假均衡 |
+| MoE 稳定性 | 使用 harness 内置 fake balance | IDs/weights 与 RTP 对齐；vLLM 为两个原地 kernel |
 
 **一句话**:长序列大 batch 场景下,跳 prefill + 伪造 KV 是唯一可行且正确的选择
 (缺官方「一进来就是 decode」API;更简单的「真跑 prefill」仅适短/小)。(1) `collective_rpc`
-化已把它从 TP=1 解放(`4932a086f`),剩下 (2) MoE 补强制均衡路由。稳定性靠定长批调度,不靠 prefill。
+化已把它从 TP=1 解放(`4932a086f`),(2) MoE fake balance 也已补齐。稳定性靠定长批调度
+和确定性专家路由,不靠 prefill。
 
 ---
 
@@ -720,13 +723,11 @@ decode 测量循环每步调 `run_step`(`perf_test_runner.py:173`),其中每步�
   `run_step_no_timing`——本改动即让墙钟测量路径对齐采集路径。
 - **优先级理由**:最便宜,且直接决定 decode 数字是否偏高。
 
-### P1 —— MoE 稳定性缺口(仅 MoE 模型)
+### P1（已完成）—— MoE 稳定性(仅 MoE 模型)
 
-伪造 KV → hidden state 假 → gating 路由假 → 专家负载不均 → 每轮方差大(见 §11.2)。vLLM 无
-`FAKE_BALANCE_EXPERT` 对应旋钮;`EPLBConfig`(`vllm/config/parallel.py:57`)是运行时真搬迁
-专家的负载均衡器,非"强制假均匀路由"的压测开关。
-
-- **修法**:补一个"强制均衡路由"shim(patch gating 让每 token 均匀落专家)。Dense 模型无需此项。
+实现已在真实 `select_experts` 后安装确定性 post-select wrapper，并在权重和最终 modular
+kernel 准备完成后预生成共享模板。模板复刻 RTP 的 DP/EP offset，weights 恒为 1；worker
+审计要求所有 MoE 层均完成 finalization。monolithic、EPLB 和非 CUDA 配置显式失败。
 
 ### P2 —— 清晰度 / 防误读:非 EP 的"DP"不是 DP;执行步 barrier 冗余
 
@@ -767,7 +768,7 @@ decode 测量循环每步调 `run_step`(`perf_test_runner.py:173`),其中每步�
 | 项 | 影响面 | 成本 | 是否本场景必修 |
 |---|---|---|---|
 | P0 去 per-step sync | decode 数字准确性 | 低 | 是（当前唯一硬缺口） |
-| P1 MoE 强制均衡路由 | MoE 稳定性 | 中 | 测 MoE 时必修 |
+| P1 MoE 强制均衡路由（已完成） | MoE 稳定性 | 中 | harness 已内置 |
 | P2 澄清伪 DP / 去冗余 barrier | 可读性 / 结果可信度 | 低 | 建议 |
 | P3 MP Core(独立进程);不做 L3-b | 生产进程模型保真度 | 高 | 可选演进 |
 

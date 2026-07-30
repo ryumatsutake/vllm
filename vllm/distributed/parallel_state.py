@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -1999,6 +2000,16 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
         _EP.prepare_communication_buffer_for_model(model)
     if _EPLB is not None:
         _EPLB.prepare_communication_buffer_for_model(model)
+
+    if os.environ.get("FAKE_BALANCE_EXPERT") == "1":
+        # Some MoE methods select their final modular kernel above rather than
+        # in process_weights_after_loading. Fake routing must be initialized
+        # after that selection and before profiling or CUDA graph capture.
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+            finalize_fake_balance_for_model,
+        )
+
+        finalize_fake_balance_for_model(model)
 
 
 def model_parallel_is_initialized():

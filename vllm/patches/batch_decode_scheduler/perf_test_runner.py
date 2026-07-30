@@ -311,6 +311,12 @@ def parse_args() -> argparse.Namespace:
         "across DP ranks with all-to-all communication)",
     )
     parser.add_argument(
+        "--disable-fake-balance-expert",
+        action="store_true",
+        help="Use the model's real MoE gating. Fake-balance routing is enabled "
+        "by default to match RTP-LLM perf tests.",
+    )
+    parser.add_argument(
         "--disable-mm", action="store_true",
         help="Text-only decode of a VL model: zero multimodal slots so the "
         "engine skips vision profiling (aligns with RTP-LLM's text benchmark).",
@@ -409,6 +415,7 @@ def _run_bench_grid(
         worker_profiler_dir=args.worker_profile_dir,
         inject_scopes=(args.vllm_scopes or args.vllm_scopes_v1),
         scope_forward=args.scope_forward,
+        fake_balance_expert=not args.disable_fake_balance_expert,
     )
     try:
         print(f"Harness ready in {time.time() - t0:.1f}s")
@@ -563,6 +570,8 @@ def _dp_worker(
     """Worker process for one DP rank (runs batch_sizes as-is, per-rank)."""
     os.setsid()
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ["FAKE_BALANCE_DP_RANK"] = str(rank)
+    os.environ["FAKE_BALANCE_DP_SIZE"] = str(dp_size)
     _apply_scope_env(args)
 
     if use_dp_env:
@@ -609,6 +618,8 @@ def main() -> None:
     dp_size = args.dp_size
 
     if dp_size <= 1:
+        os.environ["FAKE_BALANCE_DP_RANK"] = "0"
+        os.environ["FAKE_BALANCE_DP_SIZE"] = "1"
         results = _run_bench_grid(args, batch_sizes, seq_lens)
         print()
         print_table(results)

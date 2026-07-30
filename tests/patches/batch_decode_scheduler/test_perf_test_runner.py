@@ -6,6 +6,7 @@ from vllm.patches.batch_decode_scheduler import perf_test_runner as runner
 from vllm.patches.batch_decode_scheduler.perf_test_harness import (
     BenchHarness,
     StepStat,
+    _validate_fake_balance_audits,
 )
 
 
@@ -194,3 +195,86 @@ def test_dp_failure_reasons_accept_clean_completion():
         {0: 0, 1: 0},
         set(),
     )
+
+
+def test_fake_balance_audit_accepts_dense_and_ready_workers():
+    _validate_fake_balance_audits(
+        [
+            {
+                "rank": 0,
+                "moe_layer_count": 0,
+                "finalized_layer_count": 0,
+                "layers": [],
+            },
+            {
+                "rank": 1,
+                "moe_layer_count": 1,
+                "finalized_layer_count": 1,
+                "layers": [{"layer": "moe", "ready": True}],
+            },
+        ]
+    )
+
+
+def test_fake_balance_audit_rejects_silent_noop():
+    audits = [
+        {
+            "rank": 2,
+            "moe_layer_count": 1,
+            "finalized_layer_count": 0,
+            "layers": [
+                {
+                    "layer": "model.layers.0.mlp.experts",
+                    "ready": False,
+                    "errors": ["router wrapper is missing"],
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="finalized 0/1"):
+        _validate_fake_balance_audits(audits)
+
+
+def test_fake_balance_audit_accepts_explicitly_disabled_workers():
+    _validate_fake_balance_audits(
+        [
+            {
+                "rank": 0,
+                "moe_layer_count": 1,
+                "finalized_layer_count": 0,
+                "layers": [
+                    {
+                        "layer": "moe",
+                        "enabled": False,
+                        "finalized": False,
+                        "wrapped": False,
+                        "template_present": False,
+                    }
+                ],
+            }
+        ],
+        expected_enabled=False,
+    )
+
+
+def test_fake_balance_audit_rejects_active_state_when_disabled():
+    audits = [
+        {
+            "rank": 0,
+            "moe_layer_count": 1,
+            "finalized_layer_count": 1,
+            "layers": [
+                {
+                    "layer": "moe",
+                    "enabled": True,
+                    "finalized": True,
+                    "wrapped": True,
+                    "template_present": True,
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="disabled but active on 1/1"):
+        _validate_fake_balance_audits(audits, expected_enabled=False)
